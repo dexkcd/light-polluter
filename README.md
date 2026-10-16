@@ -96,20 +96,28 @@ The script starts at the sensor's lowest gain (`--gain low`) with 100 ms integra
 
 ## Full experiment session
 
-`session.py` runs the whole experimental procedure in one sitting, with the box sealed the entire time. Conditions change by script, not by opening the box. Each condition is its own run with its own set of files. With the default durations it takes about 1 hour 40 minutes:
+`session.py` runs the whole experimental procedure in one sitting, with the box sealed the entire time. Conditions change by script, not by opening the box. Each condition is its own run with its own set of files. With the default durations it takes about 1 hour 42 minutes:
 
-| # | Run | Default | What the LEDs do | Purpose |
-| --- | --- | --- | --- | --- |
-| 1 | `dark` | 1 min | Both off | The sensor's dark floor |
-| 2 | `warmup` | 2 min | Test LED at `--high` | Lets the LED settle thermally, so its warm-up drift doesn't land in the baseline |
-| 3 | `baseline_high` | 12 min | Test LED constant at `--high` | Noise floor at full brightness |
-| 4 | `baseline_low` | 12 min | Test LED constant at `--low` | Noise floor at the dimmest planned setting |
-| 5 | `steps_clean` | 15 min | Test LED switches off and on, each state lasting a random 20–60 s | Core test for BOCPD vs. CUSUM: detection delay and false-alarm rate |
-| 6 | `steps_pollution` | 15 min | Same, while the pollution LED switches on its own schedule (each state 15–45 s) | Robustness: catching real changes without false-alarming on the pollution LED |
-| 7 | `ramp_clean` | 20 min | Test LED ramps between `--high` and `--low`, each ramp a random 1–3 min, with a 20 s plateau after each | Core test for GP regression / Poisson GAM |
-| 8 | `ramp_pollution` | 20 min | Same, while the pollution LED switches on its own schedule | Whether the gradual-change methods' confidence intervals stay honest under pollution |
+| # | Run | Default | Pollution | What's random | Purpose |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `dark` | 1 min | off | Nothing | Both LEDs off: the sensor's dark floor |
+| 2 | `warmup` | 2 min | off | Nothing | Test LED at `--high`, so its warm-up drift doesn't land in the baseline |
+| 3 | `baseline_high` | 12 min | off | Nothing | Noise floor at the bright end (raw counts, not just lux) |
+| 4 | `baseline_low` | 12 min | off | Nothing | Noise floor at the dim end, where shot noise bites hardest |
+| 5 | `steps_clean` | 15 min | off | Each dwell before a toggle, uniform(20 s, 60 s) | Core BOCPD vs. CUSUM test: the easy case |
+| 6 | `steps_pollution_low` | 9 min | low | The dwell, and each pollution state, uniform(15 s, 25 s) | First point on the noise curve |
+| 7 | `steps_pollution_high` | 9 min | high | The dwell, and each pollution state, uniform(3 s, 7 s) | Second point: the stress case for RQ1 |
+| 8 | `ramp_clean` | 20 min | off | Each ramp's duration, uniform(60 s, 180 s) | Core GP vs. GAM vs. EWMA test |
+| 9 | `ramp_pollution_low` | 11 min | low | Ramp duration, and each pollution state, uniform(15 s, 25 s) | Calibration under light noise |
+| 10 | `ramp_pollution_high` | 11 min | high | Ramp duration, and each pollution state, uniform(3 s, 7 s) | Calibration under heavy noise: do GP's intervals stay honest? |
 
-The pollution LED's schedule is independent of the test LED's, so the two never line up by design. Timings are random within their ranges so no method can latch onto a fixed rhythm. Everything random comes from `--seed`, which is printed at the start and saved in every run's meta file, so a session can be repeated exactly.
+In the steps runs the test LED switches between off and `--high`. In the ramp runs it ramps between `--high` and `--low`, alternating down and up, with a 20 s plateau after each ramp.
+
+**Only timing is random, never the values.** The brightness levels and the pollution condition (off, low or high) are fixed and chosen in advance. Each run's meta file records them as labels (`change`, `pollution_level` and `brightness`), so results can be grouped by condition afterwards (see [Grouping runs by condition](#grouping-runs-by-condition)). What's random is when things happen: how long each dwell lasts, how long each ramp takes, and when the pollution LED switches. The pollution LED runs on its own schedule, independent of the test LED.
+
+**Every run has its own seeds.** `--seed` sets the session seed, which is printed at the start. Each run's seeds are derived from it and saved in its meta file: `schedule_seed` for the test LED and `pollution_seed` for the pollution LED. Running again with the same `--seed` reproduces every run's exact schedule. Every LED change is also logged with its timestamp, so the LED files are the ground truth whatever the seed.
+
+For more trials at each condition, run more sessions. Each new session gets a new seed unless you set one, and the meta labels let you pool runs from several sessions.
 
 The test LED isn't switched off between runs (except where a run starts from off), so its temperature carries over smoothly from one condition to the next.
 
@@ -130,28 +138,39 @@ Before committing the full session, do a dry run of about 5 minutes. It runs eve
 python session.py --broker <laptop IP> --low 0.2 --time-scale 0.05
 ```
 
+If the full session is too long for one sitting, the easiest trim is to drop to a single pollution level. That takes it to about 1 hour 22 minutes, but you can then only compare clean against polluted, not show a trend across noise levels:
+
+```
+python session.py --broker <laptop IP> --low 0.2 --skip steps_pollution_high ramp_pollution_high
+```
+
 ### If a session is interrupted
 
-Ctrl+C turns both LEDs off, marks the current run as `stopped early`, and prints the command to run the remaining conditions with the same seed. If the LED has been off for a while, add `warmup` to the start of the list, for example:
+Ctrl+C turns both LEDs off, marks the current run as `stopped early`, and prints the command to run the remaining runs with the same seed. If the LED has been off for a while, add `warmup` to the start of the list, for example:
 
 ```
-python session.py --broker <laptop IP> --low 0.2 --seed 123456 --only warmup ramp_clean ramp_pollution
+python session.py --broker <laptop IP> --high 1 --low 0.2 --seed 123456 --only warmup ramp_clean ramp_pollution_low ramp_pollution_high
 ```
+
+Include any other options you changed, so the conditions match the original session.
 
 ### Useful options
 
 | Option | Default | What it changes |
 | --- | --- | --- |
 | `--high`, `--low` | 1.0, 0.2 | Full brightness and the dimmest planned setting |
-| `--step-levels` | `--high` | "On" levels for the steps runs, used in rotation. For example `--step-levels 1.0 0.5 0.25` sweeps the step size. |
-| `--toggle-min`, `--toggle-max` | 20, 60 | Seconds each off/on state lasts in the steps runs |
-| `--pollution-min`, `--pollution-max` | 15, 45 | Seconds each pollution LED state lasts |
-| `--ramp-min`, `--ramp-max` | 60, 180 | Seconds each ramp lasts |
+| `--step-levels` | `--high` | "On" level for the steps runs. Give several to rotate through them in a fixed order, such as `--step-levels 1.0 0.5`. Each toggle's level is logged. |
+| `--pollution-low MIN MAX` | 15 25 | Seconds each pollution LED state lasts in the low-pollution runs |
+| `--pollution-high MIN MAX` | 3 7 | Seconds each pollution LED state lasts in the high-pollution runs |
+| `--dwell MIN MAX` | 20 60 | Seconds each off/on state lasts in the steps runs |
+| `--ramp-duration MIN MAX` | 60 180 | Seconds each ramp takes |
 | `--ramp-hold` | 20 | Seconds of plateau after each ramp |
 | `--ramp-step` | 1.0 | Seconds between brightness steps within a ramp |
-| `--dark-minutes`, `--warmup-minutes`, `--baseline-minutes`, `--steps-minutes`, `--ramp-minutes` | 1, 2, 12, 15, 20 | Run lengths. `--baseline-minutes` applies to both baselines, and so on. |
-| `--only` | all | Run just these conditions, in plan order |
-| `--seed` | random | Seed for all random timings |
+| `--dark-minutes`, `--warmup-minutes`, `--baseline-minutes` | 1, 2, 12 | Run lengths. `--baseline-minutes` applies to both baselines. |
+| `--steps-minutes`, `--steps-pollution-minutes` | 15, 9 | Length of the clean steps run, and of each polluted steps run |
+| `--ramp-minutes`, `--ramp-pollution-minutes` | 20, 11 | Length of the clean ramp run, and of each polluted ramp run |
+| `--only RUN ...`, `--skip RUN ...` | all | Run just these runs, or leave these out. Plan order is kept. |
+| `--seed` | random | Session seed for all random timings |
 | `--time-scale` | 1.0 | Multiplies every duration, for dry runs |
 
 `--gain`, `--integration`, `--period` and `--data-dir` work as in `rig.py`. Run `python session.py --help` for the full list.
@@ -241,7 +260,13 @@ One JSON object per line: one at the start of the run and one at the end. Beside
 | `settings` | Start | Every option the script was run with, such as `level`, `gain` and `integration` (or `high`, `low` and the timing ranges for `session.py`) |
 | `session`, `run_index` | Start | `session.py` only: the session's start time, and this run's number in the plan |
 | `purpose`, `minutes` | Start | `session.py` only: what the run is for, and how long it was planned to last |
-| `seed` | Start | `session.py` only: the seed behind every random timing in the session |
+| `change` | Start | `session.py` only: what the test LED does, `none` (constant or dark), `steps` or `ramp` |
+| `pollution_level` | Start | `session.py` only: the pollution condition, `off`, `low` or `high` |
+| `pollution_interval_s` | Start | `session.py` only: the range each pollution LED state lasts, such as `[15, 25]`. Empty when pollution is off. |
+| `brightness` | Start | `session.py` only: the fixed test LED levels, such as `{"type": "steps", "off": 0.0, "on": [1.0]}`, `{"type": "ramp", "high": 1.0, "low": 0.2}` or `{"type": "constant", "level": 0.2}` |
+| `timing` | Start | `session.py` only: the ranges the random timings were drawn from, such as `{"dwell_s": [20, 60]}` or `{"ramp_duration_s": [60, 180], "ramp_hold_s": 20, "ramp_step_s": 1.0}` |
+| `session_seed` | Start | `session.py` only: the session's seed, the one you pass to `--seed` |
+| `schedule_seed`, `pollution_seed` | Start | `session.py` only: this run's own seeds for the test LED's and the pollution LED's timings. `pollution_seed` is empty when pollution is off. |
 | `period` | Start | Seconds between sensor readings actually used |
 | `pwm_frequency` | Start | Frequency of the test LED's dimming signal, in Hz |
 | `test_led_pin`, `pollution_led_pin` | Start | GPIO numbers the LEDs were driven from |
@@ -276,4 +301,22 @@ sensor["since_change"] = sensor["mono"] - sensor["last_change"]
 
 # Drop failed reads, and readings whose measurement overlapped an LED change
 clean = sensor[sensor["error"].isna() & (sensor["since_change"] > sensor["integration_ms"] / 1000)]
+```
+
+### Grouping runs by condition
+
+Each `session.py` run's meta file starts with its condition labels. This builds a table of runs and picks out every run with a given condition, across all sessions:
+
+```python
+import glob, json
+import pandas as pd
+
+# One row per run, with its condition labels, from the first (start) line of each meta file
+runs = pd.DataFrame([json.loads(open(f).readline()) for f in sorted(glob.glob("data/*_meta.jsonl"))])
+runs = runs.dropna(subset=["change"])  # keep session.py runs
+print(runs[["run", "change", "pollution_level", "schedule_seed"]])
+
+# For example, every steps run at high pollution
+for run in runs[(runs["change"] == "steps") & (runs["pollution_level"] == "high")]["run"]:
+    sensor = pd.read_csv(f"data/{run}_sensor.csv")
 ```
