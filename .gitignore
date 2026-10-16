@@ -1,0 +1,8 @@
+# Run data written by logger.py
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
