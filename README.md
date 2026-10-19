@@ -13,8 +13,9 @@ The laptop logs both streams to CSV, and all analysis happens afterwards on the 
 
 | File | Runs on | What it does |
 | --- | --- | --- |
-| `rig.py` | Pi | Reads the sensor about twice a second, runs one LED test, publishes everything over MQTT, and keeps a backup copy on the Pi |
-| `session.py` | Pi | Runs the full experimental procedure in one sitting: every condition back to back, each as its own run (see [Full experiment session](#full-experiment-session)) |
+| `rig.py` | Pi | Reads the sensor once a second, runs one LED test, publishes everything over MQTT, and keeps a backup copy on the Pi |
+| `session.py` | Pi | Runs a whole experiment session in one sitting: every condition back to back, each as its own run (see [Experiment sessions](#experiment-sessions)) |
+| `check_session.py` | Laptop | Checks a session's data: every run finished, brightness matches the LED log, seeds and sensor settings, step sizes in counts (see [Checking a session](#checking-a-session)) |
 | `logger.py` | Laptop | Subscribes to the broker and writes one set of CSV files per run |
 | `mosquitto.conf` | Laptop | Lets the Pi connect to the Mosquitto broker over the local network |
 
@@ -94,9 +95,23 @@ Every run records `--dark-seconds` (default 30) with both LEDs off before and af
 
 The script starts at the sensor's lowest gain (`--gain low`) with 100 ms integration. If it prints a saturation warning at these settings, the test LED is too bright for the sensor, so use a lower `--level`. If readings are tiny (under about 100), try `--gain med`.
 
-## Full experiment session
+## Experiment sessions
 
-`session.py` runs the whole experimental procedure in one sitting, with the box sealed the entire time. Conditions change by script, not by opening the box. Each condition is its own run with its own set of files. With the default durations it takes about 1 hour 42 minutes:
+`session.py` runs a whole session in one sitting, with the box sealed the entire time. Conditions change by script, not by opening the box. Each condition is its own run with its own set of files. Choose the plan with `--plan`:
+
+| Plan | Sessions | Runs | Length |
+| --- | --- | --- | --- |
+| `main` | 1 and 2 | 1–10 | about 1 h 42 min |
+| `small-steps` | 3 and 4 | 11–18 | about 1 h 12 min |
+
+These rules hold in both plans:
+
+- **Only timing is random, never the values.** The brightness levels and the pollution condition (off, low or high) are fixed and chosen in advance. Each run's meta file records them as labels (`change`, `pollution_level` and `brightness`), so results can be grouped by condition afterwards (see [Grouping runs by condition](#grouping-runs-by-condition)). What's random is when things happen: how long each dwell lasts, how long each ramp takes, and when the pollution LED switches. The pollution LED is on/off only and runs on its own schedule, independent of the test LED.
+- **Every session gets a new seed.** The session seed is printed at the start. Each run's own seeds are derived from it and saved in its meta file: `schedule_seed` for the test LED and `pollution_seed` for the pollution LED. A new session never reuses an earlier session's seed (see [Seeds](#seeds)).
+- **The test LED isn't switched off between runs** (except where a run starts from off), so its temperature stays stable from one run to the next.
+- **Every LED command is logged with its time**, including each run's first command even when it leaves the LED where it was, so the LED log shows exactly when each run's first command was given. The first sensor reading of each run is usually taken just before that command, so it still reflects the previous run's brightness. Leave it out or handle it in the analysis.
+
+### Main plan (sessions 1–2)
 
 | # | Run | Default | Pollution | What's random | Purpose |
 | --- | --- | --- | --- | --- | --- |
@@ -113,75 +128,109 @@ The script starts at the sensor's lowest gain (`--gain low`) with 100 ms integra
 
 In the steps runs the test LED switches between off and `--high`. In the ramp runs it ramps between `--high` and `--low`, alternating down and up, with a 20 s plateau after each ramp.
 
-**Only timing is random, never the values.** The brightness levels and the pollution condition (off, low or high) are fixed and chosen in advance. Each run's meta file records them as labels (`change`, `pollution_level` and `brightness`), so results can be grouped by condition afterwards (see [Grouping runs by condition](#grouping-runs-by-condition)). What's random is when things happen: how long each dwell lasts, how long each ramp takes, and when the pollution LED switches. The pollution LED runs on its own schedule, independent of the test LED.
-
-**Every run has its own seeds.** `--seed` sets the session seed, which is printed at the start. Each run's seeds are derived from it and saved in its meta file: `schedule_seed` for the test LED and `pollution_seed` for the pollution LED. Running again with the same `--seed` reproduces every run's exact schedule. Every LED change is also logged with its timestamp, so the LED files are the ground truth whatever the seed.
-
-For more trials at each condition, run more sessions. Each new session gets a new seed unless you set one, and the meta labels let you pool runs from several sessions.
-
-The test LED isn't switched off between runs (except where a run starts from off), so its temperature carries over smoothly from one condition to the next.
-
-### Running it
-
-Start the broker and `logger.py` on the laptop as usual. Then on the Pi:
-
 ```
-python session.py --list                                   # show the plan and total time
-python session.py --broker <laptop IP> --low 0.2           # the real session
+python session.py --plan main --broker <laptop IP> --low 0.2
 ```
 
-Set `--low` to your dimmest planned brightness (the default is 0.2). `--high` defaults to full brightness (1.0).
+If it's too long for one sitting, `--skip steps_pollution_high ramp_pollution_high` drops to a single pollution level (about 1 h 22 min), at the cost of only comparing clean against polluted rather than showing a trend across noise levels.
 
-Before committing the full session, do a dry run of about 5 minutes. It runs every condition with all durations scaled down:
+### Small-step plan (sessions 3–4)
+
+The main sessions showed that a step from off to full brightness (about 580 counts) is about 30 times the pollution LED's effect (about 20 counts), so every method can tell real changes from pollution by size alone. The small-step plan adds steps closer to the pollution's size, and gives the LED the 5 minutes it needs to settle thermally:
+
+| # | Run | Default | Test LED | Pollution LED |
+| --- | --- | --- | --- | --- |
+| 11 | `dark` | 1 min | Off | Off |
+| 12 | `warmup` | 5 min | Constant at `--high` (1.0) | Off |
+| 13 | `steps85_clean` | 15 min | Alternates 1.0 / 0.85 | Off |
+| 14 | `steps85_pollution_low` | 9 min | Alternates 1.0 / 0.85 | Each state uniform(15 s, 25 s) |
+| 15 | `steps85_pollution_high` | 9 min | Alternates 1.0 / 0.85 | Each state uniform(3 s, 7 s) |
+| 16 | `steps95_clean` | 15 min | Alternates 1.0 / 0.95 | Off |
+| 17 | `steps95_pollution_low` | 9 min | Alternates 1.0 / 0.95 | Each state uniform(15 s, 25 s) |
+| 18 | `steps95_pollution_high` | 9 min | Alternates 1.0 / 0.95 | Each state uniform(3 s, 7 s) |
+
+Each steps run starts at 1.0 and switches between its two levels, never off, each state lasting a random uniform(20 s, 60 s). The levels are set with `--steps85-levels` and `--steps95-levels`, and each run's meta file records them as `brightness`, such as `[1.0, 0.85]`.
+
+Session 3 runs the 85 % block (13–15) first. Session 4 runs the 95 % block (16–18) first, with `--block-order 95-first`, so the methods can be tuned on one session and tested on the other. Runs keep their numbers and names whichever order they run in. Each run's meta file records the order as `run_order` and the run's place in the session as `position`.
 
 ```
-python session.py --broker <laptop IP> --low 0.2 --time-scale 0.05
+python session.py --plan small-steps --list                                          # show the plan
+python session.py --plan small-steps --broker <laptop IP> --time-scale 0.05          # dry run, about 4 min
+python session.py --plan small-steps --broker <laptop IP>                            # session 3
+python session.py --plan small-steps --broker <laptop IP> --block-order 95-first     # session 4
 ```
 
-If the full session is too long for one sitting, the easiest trim is to drop to a single pollution level. That takes it to about 1 hour 22 minutes, but you can then only compare clean against polluted, not show a trend across noise levels:
+Between sessions 3 and 4, check session 3 on the laptop (see [Checking a session](#checking-a-session)).
 
-```
-python session.py --broker <laptop IP> --low 0.2 --skip steps_pollution_high ramp_pollution_high
-```
+### Keep the sensor settings the same
+
+Keep the sensor settings the same in every session, so all the data is comparable: one reading per second (`--period 1`, the default), and the same `--gain` and `--integration` as before (the defaults are `low` and 100 ms). `check_session.py` shows each session's settings and flags any session that differs.
+
+### Seeds
+
+Every new session draws a new seed and checks it against the sessions already in the Pi's backup folder (`~/rig-data`), so it never reuses one. Running with an earlier session's seed is refused, except together with `--only` to finish an interrupted session.
 
 ### If a session is interrupted
 
 Ctrl+C turns both LEDs off, marks the current run as `stopped early`, and prints the command to run the remaining runs with the same seed. If the LED has been off for a while, add `warmup` to the start of the list, for example:
 
 ```
-python session.py --broker <laptop IP> --high 1 --low 0.2 --seed 123456 --only warmup ramp_clean ramp_pollution_low ramp_pollution_high
+python session.py --plan small-steps --broker <laptop IP> --block-order 95-first --seed 123456 --only warmup steps85_clean steps85_pollution_low steps85_pollution_high
 ```
 
 Include any other options you changed, so the conditions match the original session.
+
+### Checking a session
+
+On the laptop, `check_session.py` reads `data/` and prints the checks for a session (the newest, unless you name one):
+
+```
+python check_session.py                       # the newest session
+python check_session.py 20261019-200512       # a specific session
+python check_session.py --plot                # also save a plot of each steps run (needs: pip install matplotlib)
+```
+
+It shows:
+
+- every session in `data/` with its plan, seed, sensor settings and how many runs finished, flagging a seed used by two sessions or sensor settings that differ from the others
+- every run of the checked session with its status, the `brightness` in its meta file, the levels actually in its LED log, and how many times the pollution LED switched on
+- the step size of every steps run: the median counts at each test LED level with the pollution LED off, and how many times larger than the pollution that is
+- how much the pollution LED adds, from the session's pollution runs
+
+It ends with `All checks passed`, or a list of problems: a run that didn't finish, brightness that doesn't match the LED log, a reused seed, different sensor settings, failed or saturated readings. `--plot` saves `<run>_plot.png` next to each steps run's data, with the counts above the commanded test LED level and the pollution LED's on periods shaded.
+
+After session 3, the 85 % steps should be about 85 counts and the 95 % steps about 28. If the 95 % steps are hard to see, check the brightness setting before running session 4.
 
 ### Useful options
 
 | Option | Default | What it changes |
 | --- | --- | --- |
-| `--high`, `--low` | 1.0, 0.2 | Full brightness and the dimmest planned setting |
-| `--step-levels` | `--high` | "On" level for the steps runs. Give several to rotate through them in a fixed order, such as `--step-levels 1.0 0.5`. Each toggle's level is logged. |
+| `--plan` | (required) | `main` or `small-steps` |
+| `--block-order` | `85-first` | Small-step plan: which block of steps runs first. Use `95-first` for session 4. |
+| `--steps85-levels A B`, `--steps95-levels A B` | 1.0 0.85, 1.0 0.95 | Small-step plan: the two levels each block alternates between, starting with the first |
+| `--high`, `--low` | 1.0, 0.2 | Full brightness (also the warm-up level) and, in the main plan, the dimmest planned setting |
+| `--step-levels` | `--high` | Main plan: "on" level for the steps runs. Give several to rotate through them in a fixed order. |
 | `--pollution-low MIN MAX` | 15 25 | Seconds each pollution LED state lasts in the low-pollution runs |
 | `--pollution-high MIN MAX` | 3 7 | Seconds each pollution LED state lasts in the high-pollution runs |
-| `--dwell MIN MAX` | 20 60 | Seconds each off/on state lasts in the steps runs |
-| `--ramp-duration MIN MAX` | 60 180 | Seconds each ramp takes |
-| `--ramp-hold` | 20 | Seconds of plateau after each ramp |
-| `--ramp-step` | 1.0 | Seconds between brightness steps within a ramp |
-| `--dark-minutes`, `--warmup-minutes`, `--baseline-minutes` | 1, 2, 12 | Run lengths. `--baseline-minutes` applies to both baselines. |
-| `--steps-minutes`, `--steps-pollution-minutes` | 15, 9 | Length of the clean steps run, and of each polluted steps run |
-| `--ramp-minutes`, `--ramp-pollution-minutes` | 20, 11 | Length of the clean ramp run, and of each polluted ramp run |
+| `--dwell MIN MAX` | 20 60 | Seconds each state lasts in the steps runs |
+| `--ramp-duration MIN MAX`, `--ramp-hold`, `--ramp-step` | 60 180, 20, 1.0 | Main plan: how long each ramp takes, the plateau after it, and the seconds between ramp steps |
+| `--dark-minutes`, `--warmup-minutes` | 1, 2 (main) or 5 (small-steps) | Run lengths |
+| `--steps-minutes`, `--steps-pollution-minutes` | 15, 9 | Length of each clean steps run, and of each polluted steps run |
+| `--baseline-minutes`, `--ramp-minutes`, `--ramp-pollution-minutes` | 12, 20, 11 | Main plan: run lengths |
 | `--only RUN ...`, `--skip RUN ...` | all | Run just these runs, or leave these out. Plan order is kept. |
-| `--seed` | random | Session seed for all random timings |
+| `--seed` | new | Session seed for all random timings. Only reuse one to finish an interrupted session. |
 | `--time-scale` | 1.0 | Multiplies every duration, for dry runs |
+| `--period` | 1.0 | Seconds between sensor readings |
 
-`--gain`, `--integration`, `--period` and `--data-dir` work as in `rig.py`. Run `python session.py --help` for the full list.
+`--gain`, `--integration` and `--data-dir` work as in `rig.py`. Run `python session.py --help` for the full list.
 
 ## Output data
 
-Each run gets an ID made from its start time and test name, for example `20261016-201500_ramp`. Runs from `session.py` share the session's start time and add their number and name, for example `20261017-140000_05_steps_clean`, so a session's files sort in order. The laptop writes three files per run to `data/`:
+Each run gets an ID made from its start time and test name, for example `20261016-201500_ramp`. Runs from `session.py` share the session's start time and add their number and name, for example `20261017-140000_05_steps_clean` or `20261019-200512_16_steps95_clean`. The laptop writes three files per run to `data/`:
 
 | File | One row per |
 | --- | --- |
-| `<run>_sensor.csv` | Sensor reading (about two per second) |
+| `<run>_sensor.csv` | Sensor reading (one per second by default) |
 | `<run>_led.csv` | Change to either LED |
 | `<run>_meta.jsonl` | Start or end of the run |
 
@@ -239,10 +288,12 @@ Notes written by `session.py`:
 | `note` | Written when |
 | --- | --- |
 | `state at run start` | First two rows of every run: where both LEDs are as the run begins, carried over from the previous run. Every run's LED file is complete on its own. |
-| `dark`, `warmup at high`, `baseline at high`, `baseline at low` | The constant runs set the test LED. No row if it was already at that level. |
-| `toggles start off` | A steps run switches the test LED off before its first toggle. No row if it was already off. |
-| `toggle on 7`, `toggle off 7` | Each toggle in a steps run, numbered |
-| `ramps start at high` | A ramp run sets the test LED to `--high` before the first ramp |
+| `dark`, `warmup at high`, `baseline at high`, `baseline at low` | A constant run's first command. Always written, even if the LED was already at that level. |
+| `toggles start off` | A main-plan steps run's first command: test LED off before the first toggle. Always written. |
+| `toggle on 7`, `toggle off 7` | Each toggle in a main-plan steps run, numbered |
+| `steps start at 1.0` | A small-step run's first command: the test LED set to the run's first level. Always written. |
+| `step 7 to 0.85` | Each switch in a small-step run, numbered, with the level it switched to |
+| `ramps start at high` | A ramp run's first command: test LED to `--high` before the first ramp. Always written. |
 | `ramp 3 down step 45/120`, `ramp 4 up step 1/90` | Each step of each ramp, with the ramp number, direction and step number. Ramps alternate down and up. A gap with no rows after the last step of a ramp is the plateau. |
 | `pollution on 4`, `pollution off 4` | Each switch of the pollution LED, numbered |
 | `pollution off at end of run` | The pollution LED was on when a pollution run ended, so it's switched off |
@@ -258,12 +309,14 @@ One JSON object per line: one at the start of the run and one at the end. Beside
 | `event` | Both | `start` or `end` |
 | `test` | Start | Which test ran: `steps`, `ramp`, `pollution` or `hold` from `rig.py`, or the run name (such as `steps_clean`) from `session.py` |
 | `settings` | Start | Every option the script was run with, such as `level`, `gain` and `integration` (or `high`, `low` and the timing ranges for `session.py`) |
-| `session`, `run_index` | Start | `session.py` only: the session's start time, and this run's number in the plan |
+| `plan` | Start | `session.py` only: `main` or `small-steps` |
+| `session`, `run_index`, `position` | Start | `session.py` only: the session's start time, this run's number in the plan (such as 16), and its place in the order the session actually ran (1 for the first run) |
+| `run_order` | Start | Small-step plan only: which block of steps ran first in the session, `85-first` or `95-first` |
 | `purpose`, `minutes` | Start | `session.py` only: what the run is for, and how long it was planned to last |
 | `change` | Start | `session.py` only: what the test LED does, `none` (constant or dark), `steps` or `ramp` |
 | `pollution_level` | Start | `session.py` only: the pollution condition, `off`, `low` or `high` |
 | `pollution_interval_s` | Start | `session.py` only: the range each pollution LED state lasts, such as `[15, 25]`. Empty when pollution is off. |
-| `brightness` | Start | `session.py` only: the fixed test LED levels, such as `{"type": "steps", "off": 0.0, "on": [1.0]}`, `{"type": "ramp", "high": 1.0, "low": 0.2}` or `{"type": "constant", "level": 0.2}` |
+| `brightness` | Start | `session.py` only: the fixed test LED levels. Small-step runs give a plain list: the two step levels such as `[1.0, 0.85]`, or one level such as `[1.0]` for the warm-up. Main-plan runs give a description such as `{"type": "steps", "off": 0.0, "on": [1.0]}`, `{"type": "ramp", "high": 1.0, "low": 0.2}` or `{"type": "constant", "level": 0.2}`. |
 | `timing` | Start | `session.py` only: the ranges the random timings were drawn from, such as `{"dwell_s": [20, 60]}` or `{"ramp_duration_s": [60, 180], "ramp_hold_s": 20, "ramp_step_s": 1.0}` |
 | `session_seed` | Start | `session.py` only: the session's seed, the one you pass to `--seed` |
 | `schedule_seed`, `pollution_seed` | Start | `session.py` only: this run's own seeds for the test LED's and the pollution LED's timings. `pollution_seed` is empty when pollution is off. |
@@ -319,4 +372,7 @@ print(runs[["run", "change", "pollution_level", "schedule_seed"]])
 # For example, every steps run at high pollution
 for run in runs[(runs["change"] == "steps") & (runs["pollution_level"] == "high")]["run"]:
     sensor = pd.read_csv(f"data/{run}_sensor.csv")
+
+# Or every small-step run with the 95 % steps, from both sessions
+small95 = runs[runs["brightness"].astype(str) == "[1.0, 0.95]"]
 ```

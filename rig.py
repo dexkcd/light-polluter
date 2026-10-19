@@ -2,7 +2,7 @@
 """
 Light sensor rig: Pi side (Raspberry Pi 5).
 
-Reads the TSL2591 about twice a second, runs one LED test, and publishes every
+Reads the TSL2591 once a second, runs one LED test, and publishes every
 sensor reading and every LED change over MQTT. Each message carries a timestamp
 taken on the Pi at the moment it happened:
 
@@ -264,7 +264,7 @@ def main():
     p.add_argument("--gain", choices=list(GAINS), default="low", help="sensor gain (default low)")
     p.add_argument("--integration", type=int, choices=list(INTEGRATIONS), default=100,
                    help="sensor integration time in ms (default 100)")
-    p.add_argument("--period", type=float, default=0.5, help="seconds between readings (default 0.5)")
+    p.add_argument("--period", type=float, default=1.0, help="seconds between readings (default 1.0)")
     p.add_argument("--data-dir", default=str(Path.home() / "rig-data"), help="where the backup copy goes")
     a = p.parse_args()
 
