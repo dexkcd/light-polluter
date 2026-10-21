@@ -124,11 +124,13 @@ class Publisher:
 class Leds:
     """Every change to either LED is published immediately, stamped right after it happens."""
 
-    def __init__(self, pub, pollution_brightness=1.0):
+    def __init__(self, pub, pollution_brightness=1.0, pollution_pwm=None):
         self.pub = pub
         self.test = PWMLED(TEST_LED_PIN, frequency=PWM_FREQUENCY)
         self.pollution_brightness = pollution_brightness
-        if pollution_brightness < 1.0:
+        if pollution_pwm is None:
+            pollution_pwm = pollution_brightness < 1.0
+        if pollution_pwm:
             # Dimmed with PWM. At full brightness it stays a plain on/off output.
             self.pollution = PWMLED(POLLUTION_LED_PIN, frequency=PWM_FREQUENCY)
         else:
@@ -143,16 +145,19 @@ class Leds:
         self.test_level = level
         self.pub.send("led", {"led": "test", "level": level, "note": note}, t, mono)
 
-    def set_pollution(self, on, note=""):
-        if on and self.pollution_brightness < 1.0:
-            self.pollution.value = self.pollution_brightness
+    def set_pollution(self, on, note="", level=None):
+        """Switch the pollution LED on (at `level`, or the usual brightness) or off."""
+        level = (self.pollution_brightness if level is None else level) if on else 0.0
+        if on and level < 1.0:
+            if not isinstance(self.pollution, PWMLED):
+                raise ValueError("dimming the pollution LED needs it set up with PWM")
+            self.pollution.value = level
         elif on:
             self.pollution.on()
         else:
             self.pollution.off()
         t, mono = stamp()
         self.pollution_on = on
-        level = self.pollution_brightness if on else 0.0
         self.pub.send("led", {"led": "pollution", "level": level, "note": note}, t, mono)
 
     def all_off(self, note):

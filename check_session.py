@@ -100,16 +100,30 @@ def readings_with_state(sensor, led):
             continue
         if last_change is not None and mono - last_change < int(r["integration_ms"]) / 1000:
             continue
-        rows.append((state["test"], state["pollution"] > 0, int(r["ch0_full"])))
+        rows.append((state["test"], state["pollution"], int(r["ch0_full"])))
     return rows
 
 
 def medians_by_level(rows, pollution):
+    """Median counts at each test LED level, with the pollution LED on (True) or off (False)."""
     groups = defaultdict(list)
     for test, pol, count in rows:
-        if pol == pollution:
+        if (pol > 0) == pollution:
             groups[test].append(count)
     return {level: statistics.median(counts) for level, counts in groups.items() if len(counts) >= 3}
+
+
+def effect_by_brightness(rows):
+    """Pollution check: counts the pollution LED adds at each brightness, against its off periods."""
+    off = [count for _, pol, count in rows if pol == 0]
+    on = defaultdict(list)
+    for _, pol, count in rows:
+        if pol > 0:
+            on[pol].append(count)
+    if len(off) < 3:
+        return {}
+    base = statistics.median(off)
+    return {level: statistics.median(counts) - base for level, counts in on.items() if len(counts) >= 3}
 
 
 def pollution_effect(rows):
@@ -141,7 +155,8 @@ def fmt_levels(levels):
     return ", ".join(str(level) for level in sorted(levels, reverse=True))
 
 
-def plot_run(path, run, sensor, led, step):
+def plot_run(path, run, sensor, led, title, lower="test"):
+    """Counts over time, pollution-on periods shaded, and the `lower` LED's commanded level below."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -157,9 +172,9 @@ def plot_run(path, run, sensor, led, step):
     t_end = max(float(r["mono"]) for r in sensor) - t0
     xs = [float(r["mono"]) - t0 for r in good]
     ys = [int(r["ch0_full"]) for r in good]
-    test = sorted((float(e["mono"]) - t0, float(e["level"])) for e in led if e["led"] == "test")
-    tx = [max(0.0, t) for t, _ in test] + [t_end]
-    ty = [level for _, level in test] + [test[-1][1]]
+    shown = sorted((float(e["mono"]) - t0, float(e["level"])) for e in led if e["led"] == lower)
+    tx = [max(0.0, t) for t, _ in shown] + [t_end]
+    ty = [level for _, level in shown] + [shown[-1][1]]
     spans, on_at = [], None
     for e in sorted(led, key=lambda e: float(e["mono"])):
         if e["led"] != "pollution":
@@ -189,13 +204,12 @@ def plot_run(path, run, sensor, led, step):
         ax.tick_params(colors=ink2, labelsize=9)
     top.plot(xs, ys, color=counts_colour, lw=1.5)
     top.set_ylabel("ch0_full (counts)", color=ink2, fontsize=10)
-    title = run if step is None else f"{run}    step about {step:.0f} counts"
     top.set_title(title, loc="left", color=ink, fontsize=12)
     if spans:
         top.legend(handles=[Patch(color=pollution_colour, alpha=0.3, label="pollution LED on")],
                    loc="lower right", bbox_to_anchor=(1, 1), frameon=False, fontsize=9, labelcolor=ink2)
     bottom.step(tx, ty, where="post", color=ink2, lw=1.5)
-    bottom.set_ylabel("test LED\nlevel", color=ink2, fontsize=10)
+    bottom.set_ylabel(f"{lower} LED\nlevel", color=ink2, fontsize=10)
     bottom.set_xlabel("seconds since run start", color=ink2, fontsize=10)
     bottom.set_xlim(0, t_end)
     fig.savefig(path, dpi=120, bbox_inches="tight", facecolor=surface)
@@ -261,7 +275,7 @@ def main():
     print(f"\nSession {session}* ({plan}, seed {seed_of(start)}{order}):")
     print(f"  {'#':>2}  {'run':<23} {'status':<14} {'brightness (meta)':<22} {'levels in LED log':<22} "
           f"{'pollution':>9} {'readings':>8}")
-    results, effects = [], []
+    results, effects, checks = [], [], []
     for r in sessions[session]:
         meta, end = r["start"], r["end"]
         name = meta.get("test")
@@ -287,7 +301,9 @@ def main():
             problems.append(f"{name}: {saturated} reading(s) saturated.")
 
         rows = readings_with_state(sensor, led)
-        if meta.get("pollution_level") not in (None, "off"):
+        if meta.get("change") == "pollution_check":
+            checks.append((name, meta, effect_by_brightness(rows), r["run"], sensor, led))
+        elif meta.get("pollution_level") not in (None, "off"):
             effect = pollution_effect(rows)
             if effect is not None:
                 effects.append(effect)
@@ -295,6 +311,32 @@ def main():
             medians = medians_by_level(rows, False)
             step = max(medians.values()) - min(medians.values()) if len(medians) >= 2 else None
             results.append((meta.get("run_index", ""), name, medians, step, r["run"], sensor, led))
+
+    for name, meta, by_level, *_ in checks:
+        print(f"\nPollution check ({name}): counts the pollution LED adds at each brightness, against its")
+        print(f"off periods, with the test LED at {meta['brightness'][0]}.")
+        checked = meta.get("pollution_brightness") or []
+        top = max(by_level) if by_level else None
+        for level in checked:
+            if level not in by_level:
+                print(f"  brightness {level}: not enough readings")
+                problems.append(f"{name}: not enough readings at pollution brightness {level}.")
+                continue
+            share = ""
+            if level != top and by_level[top] > 0:
+                expected = by_level[top] * level / top
+                share = (f"  ({100 * by_level[level] / by_level[top]:.0f} % of the effect at {top}; "
+                         f"about {expected:.1f} if light follows brightness)")
+            print(f"  brightness {level}: adds {by_level[level]:.1f} counts{share}")
+            if by_level[level] <= 2:
+                problems.append(f"{name}: at brightness {level} the pollution LED hardly changes the "
+                                f"reading ({by_level[level]:.1f} counts). Is it wired and pointing into the box?")
+        levels = sorted(by_level)
+        for low, high in zip(levels, levels[1:]):
+            if by_level[high] - by_level[low] < 2:
+                problems.append(f"{name}: the pollution LED gives about the same light at brightness {low} "
+                                f"({by_level[low]:.1f} counts) as at {high} ({by_level[high]:.1f} counts). "
+                                f"Its brightness setting isn't changing its light.")
 
     pollution = statistics.median(effects) if effects else None
     if results:
@@ -317,7 +359,13 @@ def main():
             saved = []
             for number, name, medians, step, run, sensor, led in results:
                 path = Path(a.data_dir) / f"{run}_plot.png"
-                if plot_run(path, run, sensor, led, step):
+                title = run if step is None else f"{run}    step about {step:.0f} counts"
+                if plot_run(path, run, sensor, led, title):
+                    saved.append(str(path))
+            for name, meta, by_level, run, sensor, led in checks:
+                path = Path(a.data_dir) / f"{run}_plot.png"
+                added = ", ".join(f"{level}: +{count:.0f}" for level, count in sorted(by_level.items(), reverse=True))
+                if plot_run(path, run, sensor, led, f"{run}    {added} counts", lower="pollution"):
                     saved.append(str(path))
             if saved:
                 print(f"\nSaved {len(saved)} plots:\n  " + "\n  ".join(saved))

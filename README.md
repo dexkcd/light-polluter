@@ -103,6 +103,7 @@ The script starts at the sensor's lowest gain (`--gain low`) with 100 ms integra
 | --- | --- | --- | --- |
 | `main` | 1 and 2 | 1–10 | about 1 h 42 min |
 | `small-steps` | 3 and 4 | 11–18 | about 1 h 12 min |
+| `pollution-check` | any time | 0 | about 2 min: a quick check that the pollution LED's light changes with its brightness |
 
 These rules hold in both plans:
 
@@ -164,6 +165,24 @@ Between sessions 3 and 4, check session 3 on the laptop (see [Checking a session
 
 **Dimming the pollution LED.** `--pollution-brightness 0.5` switches the pollution LED on at half brightness (dimmed with PWM), so it adds about 10 counts instead of about 20. That changes the comparisons above: the 85 % steps become about 8 times the pollution and the 95 % steps about 3 times, instead of 4 times and about the same size. Use the same setting in sessions 3 and 4 so the two are comparable. Each pollution run records it in its meta file as `pollution_brightness`, and the LED log shows the on level as 0.5.
 
+### Quick pollution check
+
+`--plan pollution-check` is a 2-minute check, not an experiment run: does the pollution LED's light change when its brightness changes? The test LED stays off while the pollution LED switches 10 s on and 10 s off, three times at full brightness and then three times at 0.5. The run is saved like any other, as `<session>_00_pollution_check`.
+
+```
+python session.py --plan pollution-check --broker <laptop IP>          # on the Pi
+python check_session.py --plot                                         # on the laptop, afterwards
+```
+
+`check_session.py` prints how many counts the pollution LED adds at each brightness, what that is as a share of the effect at full brightness, and what it would be if light followed brightness exactly. It reports a problem if a lower brightness gives about the same light as a higher one (so the dimming isn't working), or if the pollution LED barely changes the reading at all. The plot shows the counts above the pollution LED's level.
+
+| Option | Default | What it changes |
+| --- | --- | --- |
+| `--check-levels` | 1.0 0.5 | Pollution LED brightness levels to check, in order. For example `--check-levels 1 0.5 0.25`. |
+| `--check-test-level` | 0.0 | Test LED level during the check. 0.0 is off; use 1.0 to see the pollution on top of the test LED, after a warm-up. |
+| `--check-cycles` | 3 | On/off cycles at each brightness |
+| `--check-on`, `--check-off` | 10, 10 | Seconds the pollution LED is on, and off between |
+
 ### Keep the sensor settings the same
 
 Keep the sensor settings the same in every session, so all the data is comparable: one reading per second (`--period 1`, the default), and the same `--gain` and `--integration` as before (the defaults are `low` and 100 ms). `check_session.py` shows each session's settings and flags any session that differs.
@@ -197,9 +216,9 @@ It shows:
 - every session in `data/` with its plan, seed, sensor settings and how many runs finished, flagging a seed used by two sessions or sensor settings that differ from the others, and noting a dimmed pollution LED
 - every run of the checked session with its status, the `brightness` in its meta file, the levels actually in its LED log, and how many times the pollution LED switched on
 - the step size of every steps run: the median counts at each test LED level with the pollution LED off, and how many times larger than the pollution that is
-- how much the pollution LED adds, from the session's pollution runs
+- how much the pollution LED adds, from the session's pollution runs, or at each brightness for a [pollution check](#quick-pollution-check)
 
-It ends with `All checks passed`, or a list of problems: a run that didn't finish, brightness that doesn't match the LED log, a reused seed, different sensor settings, failed or saturated readings. `--plot` saves `<run>_plot.png` next to each steps run's data, with the counts above the commanded test LED level and the pollution LED's on periods shaded.
+It ends with `All checks passed`, or a list of problems: a run that didn't finish, brightness that doesn't match the LED log, a reused seed, different sensor settings, failed or saturated readings. `--plot` saves `<run>_plot.png` next to each steps run's data, with the counts above the commanded test LED level and the pollution LED's on periods shaded (for a pollution check, the pollution LED's level instead).
 
 After session 3, the 85 % steps should be about 85 counts and the 95 % steps about 28. If the 95 % steps are hard to see, check the brightness setting before running session 4.
 
@@ -207,7 +226,7 @@ After session 3, the 85 % steps should be about 85 counts and the 95 % steps abo
 
 | Option | Default | What it changes |
 | --- | --- | --- |
-| `--plan` | (required) | `main` or `small-steps` |
+| `--plan` | (required) | `main`, `small-steps` or `pollution-check` |
 | `--block-order` | `85-first` | Small-step plan: which block of steps runs first. Use `95-first` for session 4. |
 | `--steps85-levels A B`, `--steps95-levels A B` | 1.0 0.85, 1.0 0.95 | Small-step plan: the two levels each block alternates between, starting with the first |
 | `--high`, `--low` | 1.0, 0.2 | Full brightness (also the warm-up level) and, in the main plan, the dimmest planned setting |
@@ -299,6 +318,8 @@ Notes written by `session.py`:
 | `ramps start at high` | A ramp run's first command: test LED to `--high` before the first ramp. Always written. |
 | `ramp 3 down step 45/120`, `ramp 4 up step 1/90` | Each step of each ramp, with the ramp number, direction and step number. Ramps alternate down and up. A gap with no rows after the last step of a ramp is the plateau. |
 | `pollution on 4`, `pollution off 4` | Each switch of the pollution LED, numbered |
+| `steady for pollution check` | The pollution check's first command: test LED to `--check-test-level`. Always written. |
+| `pollution on at 0.5 (2/3)`, `pollution off (2/3)` | Each switch in the pollution check, with the brightness and the cycle number at that brightness |
 | `pollution off at end of run` | The pollution LED was on when a pollution run ended, so it's switched off |
 | `session over` | Any LED still on is switched off at the end of the last run |
 | `stopped early` | Any LED still on is switched off because the session was interrupted |
@@ -316,12 +337,12 @@ One JSON object per line: one at the start of the run and one at the end. Beside
 | `session`, `run_index`, `position` | Start | `session.py` only: the session's start time, this run's number in the plan (such as 16), and its place in the order the session actually ran (1 for the first run) |
 | `run_order` | Start | Small-step plan only: which block of steps ran first in the session, `85-first` or `95-first` |
 | `purpose`, `minutes` | Start | `session.py` only: what the run is for, and how long it was planned to last |
-| `change` | Start | `session.py` only: what the test LED does, `none` (constant or dark), `steps` or `ramp` |
-| `pollution_level` | Start | `session.py` only: the pollution condition, `off`, `low` or `high` |
+| `change` | Start | `session.py` only: what the test LED does, `none` (constant or dark), `steps` or `ramp`, or `pollution_check` for the pollution check |
+| `pollution_level` | Start | `session.py` only: the pollution condition, `off`, `low` or `high`, or `check` for the pollution check |
 | `pollution_interval_s` | Start | `session.py` only: the range each pollution LED state lasts, such as `[15, 25]`. Empty when pollution is off. |
-| `pollution_brightness` | Start | `session.py` only: the pollution LED's brightness when on, 1.0 (full) or the `--pollution-brightness` level such as 0.5. Empty when pollution is off. Runs from before this option existed don't have it; they were all at 1.0. |
+| `pollution_brightness` | Start | `session.py` only: the pollution LED's brightness when on, 1.0 (full) or the `--pollution-brightness` level such as 0.5. Empty when pollution is off. Runs from before this option existed don't have it; they were all at 1.0. For the pollution check it's the list of brightness levels checked, such as `[1.0, 0.5]`. |
 | `brightness` | Start | `session.py` only: the fixed test LED levels. Small-step runs give a plain list: the two step levels such as `[1.0, 0.85]`, or one level such as `[1.0]` for the warm-up. Main-plan runs give a description such as `{"type": "steps", "off": 0.0, "on": [1.0]}`, `{"type": "ramp", "high": 1.0, "low": 0.2}` or `{"type": "constant", "level": 0.2}`. |
-| `timing` | Start | `session.py` only: the ranges the random timings were drawn from, such as `{"dwell_s": [20, 60]}` or `{"ramp_duration_s": [60, 180], "ramp_hold_s": 20, "ramp_step_s": 1.0}` |
+| `timing` | Start | `session.py` only: the ranges the random timings were drawn from, such as `{"dwell_s": [20, 60]}` or `{"ramp_duration_s": [60, 180], "ramp_hold_s": 20, "ramp_step_s": 1.0}`, or for the pollution check `{"on_s": 10, "off_s": 10, "cycles_per_level": 3}` |
 | `session_seed` | Start | `session.py` only: the session's seed, the one you pass to `--seed` |
 | `schedule_seed`, `pollution_seed` | Start | `session.py` only: this run's own seeds for the test LED's and the pollution LED's timings. `pollution_seed` is empty when pollution is off. |
 | `period` | Start | Seconds between sensor readings actually used |

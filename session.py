@@ -29,6 +29,10 @@ so nothing is opened or restarted in between. Pick the plan with --plan:
     18  steps95_pollution_high   9 min   same, pollution high
   --block-order 95-first runs 16-18 before 13-15 (for session 4).
 
+--plan pollution-check  (a quick check, about 2 min, not an experiment run)
+     0  pollution_check          test LED off (--check-test-level); pollution LED 10 s on / 10 s off,
+                                 3 times at each brightness in --check-levels (default 1.0, then 0.5)
+
 Only timing is random: how long each dwell lasts, how long each ramp takes and
 when the pollution LED switches. The brightness levels and the pollution
 condition are fixed, chosen in advance, and saved as labels in each run's meta
@@ -100,6 +104,11 @@ PLANS = {
          "Small steps, low pollution"),
         (18, "steps95_pollution_high", 9, "steps_pollution_minutes", "alternate", "high", "steps95_levels",
          "Small steps, high pollution"),
+    ],
+    # A quick check, not an experiment run: its length comes from the --check-* options
+    "pollution-check": [
+        (0, "pollution_check", None, None, "pollution_check", "check", None,
+         "Does the pollution LED's light change with its brightness setting?"),
     ],
 }
 ALL_NAMES = sorted({row[1] for rows in PLANS.values() for row in rows})
@@ -239,11 +248,36 @@ def ramps(run, row):
                 return
 
 
-BEHAVIOURS = {"dark": dark, "constant": constant, "steps": steps, "alternate": alternate, "ramp": ramps}
+def pollution_check(run, row):
+    """Pollution-check plan: test LED held at --check-test-level while the pollution LED
+    switches on and off, --check-cycles times at each brightness in --check-levels."""
+    a = run.a
+    run.set_test(a.check_test_level, "steady for pollution check", force=True)
+    if run.wait(a.check_off * a.time_scale):
+        return
+    for level in a.check_levels:
+        for c in range(1, a.check_cycles + 1):
+            run.leds.set_pollution(True, f"pollution on at {level} ({c}/{a.check_cycles})", level=level)
+            if run.wait(a.check_on * a.time_scale):
+                return
+            run.leds.set_pollution(False, f"pollution off ({c}/{a.check_cycles})")
+            if run.wait(a.check_off * a.time_scale):
+                return
+
+
+BEHAVIOURS = {"dark": dark, "constant": constant, "steps": steps, "alternate": alternate, "ramp": ramps,
+              "pollution_check": pollution_check}
+
+
+def check_minutes(a):
+    """Length of the pollution check: a first off period, then on and off for every cycle and level."""
+    return (a.check_off + len(a.check_levels) * a.check_cycles * (a.check_on + a.check_off)) / 60
 
 
 def test_led_levels(a, row):
     """The fixed test LED levels of a run, as a list."""
+    if row["change"] == "pollution_check":
+        return [a.check_test_level]
     if row["change"] == "dark":
         return [0.0]
     if row["change"] == "constant":
@@ -258,6 +292,15 @@ def test_led_levels(a, row):
 def condition(a, row):
     """The fixed, chosen conditions of a run, saved in its meta file for grouping later."""
     change = row["change"]
+    if change == "pollution_check":
+        return {
+            "change": "pollution_check",
+            "pollution_level": "check",
+            "pollution_interval_s": None,
+            "pollution_brightness": a.check_levels,  # every brightness checked, in order
+            "brightness": test_led_levels(a, row),
+            "timing": {"on_s": a.check_on, "off_s": a.check_off, "cycles_per_level": a.check_cycles},
+        }
     if a.plan == "small-steps":
         brightness = test_led_levels(a, row)  # e.g. [1.0, 0.85]
     elif change in ("dark", "constant"):
@@ -283,7 +326,7 @@ def condition(a, row):
 
 def describe_levels(a, row):
     levels = test_led_levels(a, row)
-    if row["change"] == "dark":
+    if row["change"] == "dark" or levels == [0.0]:
         return "off"
     if row["change"] == "ramp":
         return f"ramps {a.high}-{a.low}"
@@ -293,7 +336,8 @@ def describe_levels(a, row):
 def parse_args():
     p = argparse.ArgumentParser(description="Light sensor rig: experiment sessions")
     p.add_argument("--plan", choices=list(PLANS), required=True,
-                   help="main: sessions 1-2 (runs 1-10); small-steps: sessions 3-4 (runs 11-18)")
+                   help="main: sessions 1-2 (runs 1-10); small-steps: sessions 3-4 (runs 11-18); "
+                        "pollution-check: a quick check of the pollution LED's brightness")
     p.add_argument("--broker", help="the laptop's IP address, e.g. 192.168.50.157")
     p.add_argument("--port", type=int, default=1883)
     p.add_argument("--list", action="store_true", help="print the plan and exit")
@@ -324,6 +368,15 @@ def parse_args():
                    help="pollution LED brightness when on, 0-1 (default 1.0: plain on/off, no PWM; "
                         "below 1 it's dimmed with PWM)")
 
+    g = p.add_argument_group("pollution check (--plan pollution-check)")
+    g.add_argument("--check-levels", type=float, nargs="+", default=[1.0, 0.5], metavar="LEVEL",
+                   help="pollution LED brightness levels to check, in order (default 1.0 0.5)")
+    g.add_argument("--check-test-level", type=float, default=0.0,
+                   help="test LED level during the check (default 0.0: off)")
+    g.add_argument("--check-cycles", type=int, default=3, help="on/off cycles at each level (default 3)")
+    g.add_argument("--check-on", type=float, default=10, help="seconds the pollution LED is on (default 10)")
+    g.add_argument("--check-off", type=float, default=10, help="seconds it's off between (default 10)")
+
     g = p.add_argument_group("random timing ranges (seconds)")
     g.add_argument("--dwell", type=float, nargs=2, default=[20, 60], metavar=("MIN", "MAX"),
                    help="how long each state lasts in the steps runs (default 20 60)")
@@ -336,7 +389,8 @@ def parse_args():
     defaults = {}
     for plan, rows in PLANS.items():
         for _, _, minutes, option, *_ in rows:
-            defaults.setdefault(option, {})[plan] = minutes
+            if option:
+                defaults.setdefault(option, {})[plan] = minutes
     for option, by_plan in defaults.items():
         shown = ", ".join(f"{plan} {minutes:g}" for plan, minutes in by_plan.items())
         g.add_argument("--" + option.replace("_", "-"), dest=option, type=float, default=None,
@@ -369,6 +423,12 @@ def parse_args():
             p.error(f"--{option.replace('_', '-')} needs 0 < MIN <= MAX")
     if not 0 < a.pollution_brightness <= 1:
         p.error("--pollution-brightness must be above 0 and at most 1")
+    if not all(0 < level <= 1 for level in a.check_levels):
+        p.error("--check-levels must each be above 0 and at most 1")
+    if not 0 <= a.check_test_level <= 1:
+        p.error("--check-test-level must be between 0 and 1")
+    if a.check_cycles < 1 or a.check_on <= 0 or a.check_off <= 0:
+        p.error("--check-cycles, --check-on and --check-off must be positive")
     if a.time_scale <= 0:
         p.error("--time-scale must be positive")
     return a
@@ -388,7 +448,7 @@ def build_plan(a):
     for number, name, default, option, change, pollution_level, levels_option, purpose in ordered_rows(a):
         if (a.only and name not in a.only) or name in a.skip:
             continue
-        minutes = getattr(a, option)
+        minutes = check_minutes(a) if change == "pollution_check" else getattr(a, option)
         plan.append({
             "number": number, "name": name, "change": change, "pollution_level": pollution_level,
             "minutes": (default if minutes is None else minutes) * a.time_scale,
@@ -425,8 +485,12 @@ def main():
               f"test LED {describe_levels(a, row):<12} pollution {row['pollution_level']:<4}  {row['purpose']}")
     print(f"  Total {total:.0f} min ({int(total // 60)} h {total % 60:.0f} min)")
     print(f"Sensor: one reading every {period:g} s, gain {a.gain}, integration {a.integration} ms")
-    print("Pollution LED: " + ("on/off at full brightness" if a.pollution_brightness == 1
-                               else f"on/off at {a.pollution_brightness:g} brightness (PWM)"))
+    if a.plan == "pollution-check":
+        print(f"Pollution LED: checked at brightness {', '.join(str(level) for level in a.check_levels)}, "
+              f"{a.check_cycles} x ({a.check_on:g} s on, {a.check_off:g} s off) each")
+    else:
+        print("Pollution LED: " + ("on/off at full brightness" if a.pollution_brightness == 1
+                                   else f"on/off at {a.pollution_brightness:g} brightness (PWM)"))
     if a.list:
         return
     if not a.broker:
@@ -466,12 +530,13 @@ def main():
                   f"saved on the Pi in {pub.backup_path}")
 
         if leds is None:
-            leds = rig.Leds(pub, a.pollution_brightness)
+            pwm = a.pollution_brightness < 1 or (a.plan == "pollution-check" and min(a.check_levels) < 1)
+            leds = rig.Leds(pub, a.pollution_brightness, pollution_pwm=pwm)
         carried_level = leds.test_level if leds.test_level is not None else 0.0
         leds.pub = pub  # from here on, LED events go to this run's files
 
         schedule_seed, pollution_seed = run_seeds(a.seed, name)
-        has_pollution = row["pollution_level"] != "off"
+        has_pollution = row["pollution_level"] in ("low", "high")  # runs with a random pollution schedule
         pub.send("meta", {"event": "start", "test": name, "plan": a.plan, "session": session,
                           "run_index": row["number"], "position": position,
                           "run_order": a.block_order if a.plan == "small-steps" else None,
@@ -492,7 +557,9 @@ def main():
               f"({row['minutes']:.1f} min, test LED {describe_levels(a, row)}, pollution {row['pollution_level']})")
         reader.start()
 
-        run = Run(leds, a, schedule_seed, stop, time.monotonic() + row["minutes"] * 60)
+        # The pollution check ends when its sequence does; the slack only covers timing overheads
+        slack = 5 if row["change"] == "pollution_check" else 0
+        run = Run(leds, a, schedule_seed, stop, time.monotonic() + row["minutes"] * 60 + slack)
         pollution = None
         if has_pollution:
             interval = getattr(a, f"pollution_{row['pollution_level']}")
