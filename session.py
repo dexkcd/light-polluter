@@ -32,7 +32,9 @@ so nothing is opened or restarted in between. Pick the plan with --plan:
 Only timing is random: how long each dwell lasts, how long each ramp takes and
 when the pollution LED switches. The brightness levels and the pollution
 condition are fixed, chosen in advance, and saved as labels in each run's meta
-file so results can be grouped by condition afterwards.
+file so results can be grouped by condition afterwards. The pollution LED is
+on/off at full brightness, unless --pollution-brightness dims it with PWM to a
+fixed lower level.
 
 Every session gets a new session seed (checked against the earlier sessions'
 backups on the Pi), and each run's own seeds are derived from it and saved in
@@ -273,6 +275,7 @@ def condition(a, row):
         "change": {"dark": "none", "constant": "none", "alternate": "steps"}.get(change, change),
         "pollution_level": row["pollution_level"],
         "pollution_interval_s": getattr(a, f"pollution_{row['pollution_level']}", None),
+        "pollution_brightness": None if row["pollution_level"] == "off" else a.pollution_brightness,
         "brightness": brightness,
         "timing": timing,
     }
@@ -317,6 +320,9 @@ def parse_args():
     g = p.add_argument_group("pollution conditions (seconds each pollution LED state lasts)")
     g.add_argument("--pollution-low", type=float, nargs=2, default=[15, 25], metavar=("MIN", "MAX"))
     g.add_argument("--pollution-high", type=float, nargs=2, default=[3, 7], metavar=("MIN", "MAX"))
+    g.add_argument("--pollution-brightness", type=float, default=1.0,
+                   help="pollution LED brightness when on, 0-1 (default 1.0: plain on/off, no PWM; "
+                        "below 1 it's dimmed with PWM)")
 
     g = p.add_argument_group("random timing ranges (seconds)")
     g.add_argument("--dwell", type=float, nargs=2, default=[20, 60], metavar=("MIN", "MAX"),
@@ -361,6 +367,8 @@ def parse_args():
         low, high = getattr(a, option)
         if not 0 < low <= high:
             p.error(f"--{option.replace('_', '-')} needs 0 < MIN <= MAX")
+    if not 0 < a.pollution_brightness <= 1:
+        p.error("--pollution-brightness must be above 0 and at most 1")
     if a.time_scale <= 0:
         p.error("--time-scale must be positive")
     return a
@@ -417,6 +425,8 @@ def main():
               f"test LED {describe_levels(a, row):<12} pollution {row['pollution_level']:<4}  {row['purpose']}")
     print(f"  Total {total:.0f} min ({int(total // 60)} h {total % 60:.0f} min)")
     print(f"Sensor: one reading every {period:g} s, gain {a.gain}, integration {a.integration} ms")
+    print("Pollution LED: " + ("on/off at full brightness" if a.pollution_brightness == 1
+                               else f"on/off at {a.pollution_brightness:g} brightness (PWM)"))
     if a.list:
         return
     if not a.broker:
@@ -456,7 +466,7 @@ def main():
                   f"saved on the Pi in {pub.backup_path}")
 
         if leds is None:
-            leds = rig.Leds(pub)
+            leds = rig.Leds(pub, a.pollution_brightness)
         carried_level = leds.test_level if leds.test_level is not None else 0.0
         leds.pub = pub  # from here on, LED events go to this run's files
 
@@ -524,6 +534,8 @@ def main():
         print(f"\nSession {session} stopped early" + (f" during {stopped_in}." if stopped_in else ".")
               + f" Finished: {', '.join(finished) or 'none'}. Both LEDs are off.")
         options = f"--high {a.high:g} --low {a.low:g}" if a.plan == "main" else f"--block-order {a.block_order}"
+        if a.pollution_brightness != 1:
+            options += f" --pollution-brightness {a.pollution_brightness:g}"
         print("To run the rest with the same timings, use this plus any other options you changed")
         print("(and add 'warmup' to the list if the LED has been off a while):")
         print(f"  python session.py --plan {a.plan} --broker {a.broker} {options} "

@@ -124,10 +124,15 @@ class Publisher:
 class Leds:
     """Every change to either LED is published immediately, stamped right after it happens."""
 
-    def __init__(self, pub):
+    def __init__(self, pub, pollution_brightness=1.0):
         self.pub = pub
         self.test = PWMLED(TEST_LED_PIN, frequency=PWM_FREQUENCY)
-        self.pollution = LED(POLLUTION_LED_PIN)
+        self.pollution_brightness = pollution_brightness
+        if pollution_brightness < 1.0:
+            # Dimmed with PWM. At full brightness it stays a plain on/off output.
+            self.pollution = PWMLED(POLLUTION_LED_PIN, frequency=PWM_FREQUENCY)
+        else:
+            self.pollution = LED(POLLUTION_LED_PIN)
         self.test_level = None      # unknown until the first command
         self.pollution_on = None
 
@@ -139,13 +144,16 @@ class Leds:
         self.pub.send("led", {"led": "test", "level": level, "note": note}, t, mono)
 
     def set_pollution(self, on, note=""):
-        if on:
+        if on and self.pollution_brightness < 1.0:
+            self.pollution.value = self.pollution_brightness
+        elif on:
             self.pollution.on()
         else:
             self.pollution.off()
         t, mono = stamp()
         self.pollution_on = on
-        self.pub.send("led", {"led": "pollution", "level": 1.0 if on else 0.0, "note": note}, t, mono)
+        level = self.pollution_brightness if on else 0.0
+        self.pub.send("led", {"led": "pollution", "level": level, "note": note}, t, mono)
 
     def all_off(self, note):
         if self.test_level != 0.0:
@@ -253,6 +261,8 @@ def main():
     p.add_argument("--port", type=int, default=1883)
     p.add_argument("--test", choices=list(TESTS), required=True)
     p.add_argument("--level", type=float, default=1.0, help="test LED brightness 0-1 (default 1.0)")
+    p.add_argument("--pollution-brightness", type=float, default=1.0,
+                   help="pollution LED brightness when on, 0-1 (default 1.0: plain on/off, no PWM)")
     p.add_argument("--cycles", type=int, default=5, help="repeats for steps/ramp/pollution (default 5)")
     p.add_argument("--on-seconds", type=float, default=30, help="on time per cycle (default 30)")
     p.add_argument("--off-seconds", type=float, default=30, help="off time per cycle (default 30)")
@@ -267,6 +277,8 @@ def main():
     p.add_argument("--period", type=float, default=1.0, help="seconds between readings (default 1.0)")
     p.add_argument("--data-dir", default=str(Path.home() / "rig-data"), help="where the backup copy goes")
     a = p.parse_args()
+    if not 0 < a.pollution_brightness <= 1:
+        p.error("--pollution-brightness must be above 0 and at most 1")
 
     # Never read faster than the sensor finishes a measurement
     period = max(a.period, a.integration / 1000 + 0.02)
@@ -292,7 +304,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
-    leds = Leds(pub)
+    leds = Leds(pub, a.pollution_brightness)
     reader = SensorReader(sensor, pub, leds, period, a.gain, a.integration)
 
     pub.send("meta", {"event": "start", "test": a.test, "settings": vars(a), "period": period,

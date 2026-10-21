@@ -100,7 +100,7 @@ def readings_with_state(sensor, led):
             continue
         if last_change is not None and mono - last_change < int(r["integration_ms"]) / 1000:
             continue
-        rows.append((state["test"], state["pollution"], int(r["ch0_full"])))
+        rows.append((state["test"], state["pollution"] > 0, int(r["ch0_full"])))
     return rows
 
 
@@ -113,7 +113,7 @@ def medians_by_level(rows, pollution):
 
 
 def pollution_effect(rows):
-    on, off = medians_by_level(rows, 1.0), medians_by_level(rows, 0.0)
+    on, off = medians_by_level(rows, True), medians_by_level(rows, False)
     diffs = [on[level] - off[level] for level in on if level in off]
     return statistics.mean(diffs) if diffs else None
 
@@ -165,7 +165,7 @@ def plot_run(path, run, sensor, led, step):
         if e["led"] != "pollution":
             continue
         t, level = float(e["mono"]) - t0, float(e["level"])
-        if level == 1.0 and on_at is None:
+        if level > 0 and on_at is None:
             on_at = t
         elif level == 0.0 and on_at is not None:
             spans.append((on_at, t))
@@ -238,6 +238,9 @@ def main():
             notes.append("partial or resumed")
         if not is_dry_run(start) and usual and sensor_settings(start) != usual:
             notes.append("SENSOR SETTINGS DIFFER")
+        dimmed = start.get("settings", {}).get("pollution_brightness", 1.0)
+        if dimmed != 1.0:
+            notes.append(f"pollution LED at {dimmed:g}")
         print(f"  {s}{'*' if s == session else ' '} {start.get('plan', 'main'):<11} seed {seed_of(start)!s:>7}   "
               f"every {period:g} s, gain {gain}, {integration} ms   {finished}/{len(runs)} runs finished"
               + (f"   ({', '.join(notes)})" if notes else ""))
@@ -253,6 +256,8 @@ def main():
     # ---- The chosen session, run by run ----
     plan = start.get("plan", "main")
     order = f", block order {start['run_order']}" if start.get("run_order") else ""
+    dimmed = start.get("settings", {}).get("pollution_brightness", 1.0)
+    order += f", pollution LED at {dimmed:g} brightness" if dimmed != 1.0 else ""
     print(f"\nSession {session}* ({plan}, seed {seed_of(start)}{order}):")
     print(f"  {'#':>2}  {'run':<23} {'status':<14} {'brightness (meta)':<22} {'levels in LED log':<22} "
           f"{'pollution':>9} {'readings':>8}")
@@ -264,7 +269,7 @@ def main():
         sensor = read_csv(Path(a.data_dir) / f"{r['run']}_sensor.csv")
         led = read_csv(Path(a.data_dir) / f"{r['run']}_led.csv")
         seen = sorted({float(e["level"]) for e in led if e["led"] == "test" and e["note"] not in END_NOTES})
-        switches = sum(1 for e in led if e["led"] == "pollution" and e["level"] == "1.0")
+        switches = sum(1 for e in led if e["led"] == "pollution" and float(e["level"]) > 0)
         brightness = meta.get("brightness")
         shown = json.dumps(brightness) if isinstance(brightness, list) else (brightness or {}).get("type", "?")
         print(f"  {meta.get('run_index', ''):>2}  {name:<23} {status:<14} {shown:<22} {fmt_levels(seen):<22} "
@@ -287,7 +292,7 @@ def main():
             if effect is not None:
                 effects.append(effect)
         if meta.get("change") == "steps":
-            medians = medians_by_level(rows, 0.0)
+            medians = medians_by_level(rows, False)
             step = max(medians.values()) - min(medians.values()) if len(medians) >= 2 else None
             results.append((meta.get("run_index", ""), name, medians, step, r["run"], sensor, led))
 
