@@ -29,6 +29,24 @@ so nothing is opened or restarted in between. Pick the plan with --plan:
     18  steps95_pollution_high   9 min   same, pollution high
   --block-order 95-first runs 16-18 before 13-15 (for session 4).
 
+--plan pollution-levels  (the pollution-levels block, about 3 h 50 min)
+    21  dark                     1 min   both LEDs off
+    22  warmup                   5 min   test LED at --high
+    23  steps95_clean           15 min   test LED alternates 1.0 / 0.95, no pollution
+    24  steps85_clean           15 min   test LED alternates 1.0 / 0.85, no pollution
+    25  ramp_clean              20 min   test LED ramps between 1.0 and 0.2, no pollution
+    then one block per pollution duty (0.25, 0.5, 1.0), in an order drawn from the session seed:
+    26-31 (duty 0.25), 32-37 (duty 0.5), 38-43 (duty 1.0):
+        steps95_pollP_low  9 min, steps95_pollP_high  9 min,
+        steps85_pollP_low  9 min, steps85_pollP_high  9 min,
+        ramp_pollP_low    11 min, ramp_pollP_high    11 min
+    where P is the duty in percent (25, 50 or 100), low switches every 15-25 s and high every 3-7 s.
+
+--plan pollution-levels-test  (a check before the first pollution-levels session, about 9 min)
+    21  dark, 22  warmup (5 min), then
+     0  pollution_check          test LED at --high; pollution LED 10 s on / 10 s off,
+                                 3 times at each duty 0.25, 0.5 and 1.0
+
 --plan pollution-check  (a quick check, about 2 min, not an experiment run)
      0  pollution_check          test LED off (--check-test-level); pollution LED 10 s on / 10 s off,
                                  3 times at each brightness in --check-levels (default 1.0, then 0.5)
@@ -36,9 +54,9 @@ so nothing is opened or restarted in between. Pick the plan with --plan:
 Only timing is random: how long each dwell lasts, how long each ramp takes and
 when the pollution LED switches. The brightness levels and the pollution
 condition are fixed, chosen in advance, and saved as labels in each run's meta
-file so results can be grouped by condition afterwards. The pollution LED is
-on/off at full brightness, unless --pollution-brightness dims it with PWM to a
-fixed lower level.
+file so results can be grouped by condition afterwards. The pollution LED is on
+hardware PWM (GPIO 12); when on, it's at full brightness, --pollution-brightness,
+or in the pollution-levels plan the duty of the run's block.
 
 Every session gets a new session seed (checked against the earlier sessions'
 backups on the Pi), and each run's own seeds are derived from it and saved in
@@ -50,6 +68,8 @@ Examples:
     python session.py --plan small-steps --broker 192.168.50.157 --time-scale 0.05   # ~4 min dry run
     python session.py --plan small-steps --broker 192.168.50.157                     # session 3
     python session.py --plan small-steps --broker 192.168.50.157 --block-order 95-first   # session 4
+    python session.py --plan pollution-levels-test --broker 192.168.50.157                  # before the block
+    python session.py --plan pollution-levels --broker 192.168.50.157                       # each session
 """
 
 import argparse
@@ -110,8 +130,54 @@ PLANS = {
         (0, "pollution_check", None, None, "pollution_check", "check", None,
          "Does the pollution LED's light change with its brightness setting?"),
     ],
+    # The check before the first pollution-levels session
+    "pollution-levels-test": [
+        (21, "dark", 1, "dark_minutes", "dark", "off", None,
+         "Both LEDs off: is the dark floor unchanged?"),
+        (22, "warmup", 5, "warmup_minutes", "constant", "off", None,
+         "Test LED at --high: does it settle at the same level as before?"),
+        (0, "pollution_check", None, None, "pollution_check", "check", None,
+         "Pollution LED at each duty, test LED on: does its effect grow with duty, without flicker?"),
+    ],
 }
+
+POLLUTION_DUTIES = (0.25, 0.5, 1.0)
+RUN_DUTY = {}  # pollution-levels plan: run name -> pollution LED duty
+
+
+def pollution_levels_rows():
+    """Runs 21-25 (start and clean), then six runs per pollution duty, numbered 26-43."""
+    rows = [
+        (21, "dark", 1, "dark_minutes", "dark", "off", None,
+         "Both LEDs off: the sensor's dark floor"),
+        (22, "warmup", 5, "warmup_minutes", "constant", "off", None,
+         "Test LED at --high for the 5 min it needs to settle thermally"),
+        (23, "steps95_clean", 15, "steps_minutes", "alternate", "off", "steps95_levels",
+         "Small steps, no pollution"),
+        (24, "steps85_clean", 15, "steps_minutes", "alternate", "off", "steps85_levels",
+         "Medium steps, no pollution"),
+        (25, "ramp_clean", 20, "ramp_minutes", "ramp", "off", None,
+         "Gradual dimming, no pollution"),
+    ]
+    number = 26
+    for duty in POLLUTION_DUTIES:
+        for kind, change, levels_option, minutes, option, what in (
+                ("steps95", "alternate", "steps95_levels", 9, "steps_pollution_minutes", "Small steps"),
+                ("steps85", "alternate", "steps85_levels", 9, "steps_pollution_minutes", "Medium steps"),
+                ("ramp", "ramp", None, 11, "ramp_pollution_minutes", "Gradual dimming")):
+            for speed in ("low", "high"):
+                name = f"{kind}_poll{round(duty * 100)}_{speed}"
+                RUN_DUTY[name] = duty
+                rows.append((number, name, minutes, option, change, speed, levels_option,
+                             f"{what}, pollution duty {duty}, {speed}"))
+                number += 1
+    return rows
+
+
+PLANS["pollution-levels"] = pollution_levels_rows()
 ALL_NAMES = sorted({row[1] for rows in PLANS.values() for row in rows})
+CHECK_PLANS = ("pollution-check", "pollution-levels-test")
+LIST_BRIGHTNESS_PLANS = ("small-steps", "pollution-levels", "pollution-levels-test")
 CONSTANT_LEVEL = {"warmup": "high", "baseline_high": "high", "baseline_low": "low"}
 
 
@@ -156,19 +222,18 @@ class Run:
         return seconds >= remaining
 
     def set_test(self, level, note, force=False):
-        """Set the test LED. Publishes an event when the level changes, or always with force=True
-        (used for each run's first command, so the log shows exactly when it was given)."""
-        if force or self.leds.test_level is None or round(level, 4) != self.leds.test_level:
-            self.leds.set_test(level, note)
+        """Set the test LED. Publishes an event when the applied level changes, or always with
+        force=True (used for each run's first command, so the log shows exactly when it was given)."""
+        self.leds.set_test(level, note, only_if_changed=not force)
 
 
 class PollutionDriver(threading.Thread):
     """Switches the pollution LED on and off, each state lasting a random time
     within the condition's interval, on its own schedule."""
 
-    def __init__(self, leds, interval, time_scale, seed):
+    def __init__(self, leds, interval, time_scale, seed, level):
         super().__init__(daemon=True)
-        self.leds, self.interval, self.time_scale = leds, interval, time_scale
+        self.leds, self.interval, self.time_scale, self.level = leds, interval, time_scale, level
         self.rng = random.Random(seed)
         self.halt = threading.Event()
 
@@ -179,7 +244,7 @@ class PollutionDriver(threading.Thread):
         n = 0
         while not self._wait():
             n += 1
-            self.leds.set_pollution(True, f"pollution on {n}")
+            self.leds.set_pollution(True, f"pollution on {n}", level=self.level)
             if self._wait():
                 break
             self.leds.set_pollution(False, f"pollution off {n}")
@@ -289,6 +354,13 @@ def test_led_levels(a, row):
     return [a.high, a.low]
 
 
+def run_duty(a, row):
+    """The pollution LED's duty when it's on in this run, or 0.0 if it stays off."""
+    if row["pollution_level"] not in ("low", "high"):
+        return 0.0
+    return RUN_DUTY[row["name"]] if a.plan == "pollution-levels" else a.pollution_brightness
+
+
 def condition(a, row):
     """The fixed, chosen conditions of a run, saved in its meta file for grouping later."""
     change = row["change"]
@@ -298,10 +370,12 @@ def condition(a, row):
             "pollution_level": "check",
             "pollution_interval_s": None,
             "pollution_brightness": a.check_levels,  # every brightness checked, in order
+            "pollution_duty": a.check_levels,
             "brightness": test_led_levels(a, row),
             "timing": {"on_s": a.check_on, "off_s": a.check_off, "cycles_per_level": a.check_cycles},
         }
-    if a.plan == "small-steps":
+    duty = run_duty(a, row)
+    if a.plan in LIST_BRIGHTNESS_PLANS:
         brightness = test_led_levels(a, row)  # e.g. [1.0, 0.85]
     elif change in ("dark", "constant"):
         brightness = {"type": "constant", "level": test_led_levels(a, row)[0]}
@@ -318,10 +392,17 @@ def condition(a, row):
         "change": {"dark": "none", "constant": "none", "alternate": "steps"}.get(change, change),
         "pollution_level": row["pollution_level"],
         "pollution_interval_s": getattr(a, f"pollution_{row['pollution_level']}", None),
-        "pollution_brightness": None if row["pollution_level"] == "off" else a.pollution_brightness,
+        "pollution_brightness": None if row["pollution_level"] == "off" else duty,
+        "pollution_duty": duty,
         "brightness": brightness,
         "timing": timing,
     }
+
+
+def describe_pollution(a, row):
+    if a.plan == "pollution-levels" and row["pollution_level"] in ("low", "high"):
+        return f"{row['pollution_level']} @ {run_duty(a, row)}"
+    return row["pollution_level"]
 
 
 def describe_levels(a, row):
@@ -337,6 +418,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Light sensor rig: experiment sessions")
     p.add_argument("--plan", choices=list(PLANS), required=True,
                    help="main: sessions 1-2 (runs 1-10); small-steps: sessions 3-4 (runs 11-18); "
+                        "pollution-levels: the pollution-levels block (runs 21-43); "
+                        "pollution-levels-test: the check before that block; "
                         "pollution-check: a quick check of the pollution LED's brightness")
     p.add_argument("--broker", help="the laptop's IP address, e.g. 192.168.50.157")
     p.add_argument("--port", type=int, default=1883)
@@ -365,14 +448,23 @@ def parse_args():
     g.add_argument("--pollution-low", type=float, nargs=2, default=[15, 25], metavar=("MIN", "MAX"))
     g.add_argument("--pollution-high", type=float, nargs=2, default=[3, 7], metavar=("MIN", "MAX"))
     g.add_argument("--pollution-brightness", type=float, default=1.0,
-                   help="pollution LED brightness when on, 0-1 (default 1.0: plain on/off, no PWM; "
-                        "below 1 it's dimmed with PWM)")
+                   help="pollution LED brightness when on, 0-1 (default 1.0). Not used by the "
+                        "pollution-levels plan, which sets the duty per block.")
 
-    g = p.add_argument_group("pollution check (--plan pollution-check)")
-    g.add_argument("--check-levels", type=float, nargs="+", default=[1.0, 0.5], metavar="LEVEL",
-                   help="pollution LED brightness levels to check, in order (default 1.0 0.5)")
-    g.add_argument("--check-test-level", type=float, default=0.0,
-                   help="test LED level during the check (default 0.0: off)")
+    g = p.add_argument_group("pollution LED hardware")
+    g.add_argument("--pollution-pwm", choices=["hardware", "software", "none"], default="hardware",
+                   help="how the pollution LED is driven: hardware PWM (default), gpiozero's software "
+                        "PWM, or plain on/off")
+    g.add_argument("--pollution-pin", type=int, default=12, help="GPIO of the pollution LED (default 12)")
+    g.add_argument("--pollution-pwmchip", type=int, default=None,
+                   help="sysfs pwmchip number for hardware PWM (default: found automatically)")
+
+    g = p.add_argument_group("pollution check (--plan pollution-check or pollution-levels-test)")
+    g.add_argument("--check-levels", type=float, nargs="+", default=None, metavar="LEVEL",
+                   help="pollution LED brightness levels to check, in order "
+                        "(default 1.0 0.5; pollution-levels-test 0.25 0.5 1.0)")
+    g.add_argument("--check-test-level", type=float, default=None,
+                   help="test LED level during the check (default 0.0, off; pollution-levels-test --high)")
     g.add_argument("--check-cycles", type=int, default=3, help="on/off cycles at each level (default 3)")
     g.add_argument("--check-on", type=float, default=10, help="seconds the pollution LED is on (default 10)")
     g.add_argument("--check-off", type=float, default=10, help="seconds it's off between (default 10)")
@@ -403,6 +495,10 @@ def parse_args():
     g.add_argument("--data-dir", default=None, help="where the Pi's backup copy goes (default ~/rig-data)")
 
     a = p.parse_args()
+    if a.check_levels is None:
+        a.check_levels = list(POLLUTION_DUTIES) if a.plan == "pollution-levels-test" else [1.0, 0.5]
+    if a.check_test_level is None:
+        a.check_test_level = a.high if a.plan == "pollution-levels-test" else 0.0
     plan_names = {row[1] for row in PLANS[a.plan]}
     for option in ("only", "skip"):
         wrong = [name for name in (getattr(a, option) or []) if name not in plan_names]
@@ -429,6 +525,10 @@ def parse_args():
         p.error("--check-test-level must be between 0 and 1")
     if a.check_cycles < 1 or a.check_on <= 0 or a.check_off <= 0:
         p.error("--check-cycles, --check-on and --check-off must be positive")
+    dims = (a.pollution_brightness < 1 or a.plan in ("pollution-levels", "pollution-levels-test")
+            or (a.plan == "pollution-check" and min(a.check_levels) < 1))
+    if a.pollution_pwm == "none" and dims:
+        p.error("dimming the pollution LED needs --pollution-pwm hardware or software")
     if a.time_scale <= 0:
         p.error("--time-scale must be positive")
     return a
@@ -436,6 +536,10 @@ def parse_args():
 
 def ordered_rows(a):
     rows = PLANS[a.plan]
+    if a.plan == "pollution-levels":
+        # Start and clean runs first, then one block per duty in this session's order
+        return ([row for row in rows if row[1] not in RUN_DUTY]
+                + [row for duty in a.pollution_order for row in rows if RUN_DUTY.get(row[1]) == duty])
     if a.plan == "small-steps" and a.block_order == "95-first":
         rows = ([row for row in rows if not row[1].startswith("steps")]
                 + [row for row in rows if row[1].startswith("steps95")]
@@ -471,26 +575,36 @@ def main():
                  f"a new seed, so leave out --seed to get one. Reusing a seed is only for finishing "
                  f"an interrupted session with --only.")
 
+    # The pollution-levels plan runs its duty blocks in an order drawn from the session seed,
+    # so slow drift over a session doesn't always land on the same duty
+    a.pollution_order = (random.Random(f"{a.seed}-pollution-order").sample(POLLUTION_DUTIES, len(POLLUTION_DUTIES))
+                         if a.plan == "pollution-levels" else None)
     plan = build_plan(a)
     if not plan:
         sys.exit("Nothing to run: --only and --skip leave no runs.")
     period = max(a.period, a.integration / 1000 + 0.02)
     total = sum(row["minutes"] for row in plan)
     extras = [f"block order {a.block_order}"] if a.plan == "small-steps" else []
+    if a.pollution_order:
+        extras.append(f"pollution duty order {', '.join(str(duty) for duty in a.pollution_order)}")
     if a.time_scale != 1:
         extras.append(f"time scale {a.time_scale:g}")
     print(f"Plan {a.plan}, seed {a.seed}" + "".join(f", {extra}" for extra in extras) + ":")
     for row in plan:
         print(f"  {row['number']:2d}  {row['name']:<23} {row['minutes']:5.1f} min   "
-              f"test LED {describe_levels(a, row):<12} pollution {row['pollution_level']:<4}  {row['purpose']}")
+              f"test LED {describe_levels(a, row):<14} pollution {describe_pollution(a, row):<11} {row['purpose']}")
     print(f"  Total {total:.0f} min ({int(total // 60)} h {total % 60:.0f} min)")
     print(f"Sensor: one reading every {period:g} s, gain {a.gain}, integration {a.integration} ms")
-    if a.plan == "pollution-check":
-        print(f"Pollution LED: checked at brightness {', '.join(str(level) for level in a.check_levels)}, "
-              f"{a.check_cycles} x ({a.check_on:g} s on, {a.check_off:g} s off) each")
+    if a.plan in CHECK_PLANS:
+        print(f"Pollution check: duty {', '.join(str(level) for level in a.check_levels)}, "
+              f"{a.check_cycles} x ({a.check_on:g} s on, {a.check_off:g} s off) each, "
+              f"test LED at {a.check_test_level}")
+    elif a.plan == "pollution-levels":
+        print(f"Pollution LED duty per block, in this session's order: "
+              f"{', '.join(str(duty) for duty in a.pollution_order)}")
     else:
-        print("Pollution LED: " + ("on/off at full brightness" if a.pollution_brightness == 1
-                                   else f"on/off at {a.pollution_brightness:g} brightness (PWM)"))
+        print("Pollution LED when on: " + ("full brightness" if a.pollution_brightness == 1
+                                           else f"{a.pollution_brightness:g} brightness"))
     if a.list:
         return
     if not a.broker:
@@ -506,13 +620,17 @@ def main():
     sensor.gain = rig.GAINS[a.gain]
     sensor.integration_time = rig.INTEGRATIONS[a.integration]
     time.sleep(a.integration / 1000 + 0.05)
+    try:
+        leds = rig.Leds(None, a.pollution_brightness, a.pollution_pwm, a.pollution_pin, a.pollution_pwmchip)
+    except rig.PwmSetupError as e:
+        sys.exit(str(e))
+    print(f"Pollution LED: GPIO {a.pollution_pin}, {leds.describe_pollution()}")
 
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
     session = time.strftime("%Y%m%d-%H%M%S")
-    leds = None
     finished = []
     stopped_in = None
     for position, row in enumerate(plan, 1):
@@ -522,16 +640,13 @@ def main():
         run_id = f"{session}_{row['number']:02d}_{name}"
         pub = rig.Publisher(a.broker, a.port, run_id, data_dir)
         if not pub.connected.wait(10):
-            if leds is None:
+            if position == 1:
                 pub.close()
                 sys.exit(f"Couldn't reach the broker at {a.broker}:{a.port}. Is Mosquitto "
                          f"running on the laptop, and is that the laptop's address?")
             print("WARNING: can't reach the broker right now. Carrying on; this run is "
                   f"saved on the Pi in {pub.backup_path}")
 
-        if leds is None:
-            pwm = a.pollution_brightness < 1 or (a.plan == "pollution-check" and min(a.check_levels) < 1)
-            leds = rig.Leds(pub, a.pollution_brightness, pollution_pwm=pwm)
         carried_level = leds.test_level if leds.test_level is not None else 0.0
         leds.pub = pub  # from here on, LED events go to this run's files
 
@@ -540,13 +655,15 @@ def main():
         pub.send("meta", {"event": "start", "test": name, "plan": a.plan, "session": session,
                           "run_index": row["number"], "position": position,
                           "run_order": a.block_order if a.plan == "small-steps" else None,
+                          "pollution_order": a.pollution_order,
                           "purpose": row["purpose"], "minutes": row["minutes"],
                           **condition(a, row),
                           "session_seed": a.seed, "schedule_seed": schedule_seed,
                           "pollution_seed": pollution_seed if has_pollution else None,
                           "settings": {**vars(a), "data_dir": data_dir}, "period": period,
                           "pwm_frequency": rig.PWM_FREQUENCY, "test_led_pin": rig.TEST_LED_PIN,
-                          "pollution_led_pin": rig.POLLUTION_LED_PIN})
+                          "pollution_led_pin": a.pollution_pin, "pollution_pwm": leds.describe_pollution(),
+                          "led_log_levels": "applied"})
         # Record where both LEDs are as this run begins, so every LED file is complete on its own.
         # The test LED isn't switched off between runs, so its temperature stays stable.
         leds.set_test(carried_level, "state at run start")
@@ -554,7 +671,7 @@ def main():
 
         reader = rig.SensorReader(sensor, pub, leds, period, a.gain, a.integration)
         print(f"\n[{position}/{len(plan)}] {run_id}: {row['purpose']} "
-              f"({row['minutes']:.1f} min, test LED {describe_levels(a, row)}, pollution {row['pollution_level']})")
+              f"({row['minutes']:.1f} min, test LED {describe_levels(a, row)}, pollution {describe_pollution(a, row)})")
         reader.start()
 
         # The pollution check ends when its sequence does; the slack only covers timing overheads
@@ -563,7 +680,7 @@ def main():
         pollution = None
         if has_pollution:
             interval = getattr(a, f"pollution_{row['pollution_level']}")
-            pollution = PollutionDriver(leds, interval, a.time_scale, pollution_seed)
+            pollution = PollutionDriver(leds, interval, a.time_scale, pollution_seed, run_duty(a, row))
             pollution.start()
 
         failed = False
@@ -590,9 +707,8 @@ def main():
         else:
             stopped_in = name
 
-    if leds is not None:  # make sure nothing is left on, even if stopped between runs
-        leds.test.value = 0
-        leds.pollution.off()
+    leds.test.value = 0  # make sure nothing is left on, even if stopped between runs
+    leds.pollution.off()
 
     if len(finished) == len(plan):
         print(f"\nSession {session} finished: all {len(plan)} runs done. Both LEDs are off.")
@@ -600,13 +716,14 @@ def main():
         remaining = [row["name"] for row in plan if row["name"] not in finished]
         print(f"\nSession {session} stopped early" + (f" during {stopped_in}." if stopped_in else ".")
               + f" Finished: {', '.join(finished) or 'none'}. Both LEDs are off.")
-        options = f"--high {a.high:g} --low {a.low:g}" if a.plan == "main" else f"--block-order {a.block_order}"
+        options = {"main": f"--high {a.high:g} --low {a.low:g}",
+                   "small-steps": f"--block-order {a.block_order}"}.get(a.plan, "")
         if a.pollution_brightness != 1:
             options += f" --pollution-brightness {a.pollution_brightness:g}"
         print("To run the rest with the same timings, use this plus any other options you changed")
         print("(and add 'warmup' to the list if the LED has been off a while):")
         print(f"  python session.py --plan {a.plan} --broker {a.broker} {options} "
-              f"--seed {a.seed} --only {' '.join(remaining)}")
+              f"--seed {a.seed} --only {' '.join(remaining)}".replace("  --", " --"))
     print(f"Backups on the Pi are in {data_dir}")
 
 

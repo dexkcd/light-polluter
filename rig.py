@@ -22,7 +22,9 @@ Examples:
 """
 
 import argparse
+import atexit
 import json
+import os
 import signal
 import sys
 import threading
@@ -35,9 +37,16 @@ import paho.mqtt.client as mqtt
 from gpiozero import LED, PWMLED
 
 # Wiring: BCM GPIO numbers, physical header pin in brackets
-TEST_LED_PIN = 18        # [pin 12] -> FemtoBuck "Dim in"
-POLLUTION_LED_PIN = 23   # [pin 16] -> 150 ohm resistor -> pollution LED
-PWM_FREQUENCY = 1000     # Hz, dimming signal to the FemtoBuck
+TEST_LED_PIN = 18        # [pin 12] -> FemtoBuck "Dim in". Dimmed by gpiozero, which on the Pi 5
+                         # times the PWM in software (lgpio) and sets the duty in whole percent.
+POLLUTION_LED_PIN = 12   # [pin 32] -> 150 ohm resistor -> pollution LED, on hardware PWM.
+                         # Sessions before the pollution-levels block used GPIO 23 [pin 16], on/off only.
+PWM_FREQUENCY = 1000     # Hz, for both LEDs
+
+# Hardware PWM on the Raspberry Pi 5: the RP1 chip's PWM0 block, through Linux's sysfs interface
+PWM_CHANNELS = {12: 0, 13: 1, 18: 2, 19: 3}          # GPIO -> PWM0 channel
+PWM_OVERLAY = "dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4"
+PWM_SYSFS = Path(os.environ.get("RIG_PWM_SYSFS", "/sys/class/pwm"))  # only overridden for testing
 
 GAINS = {
     "low": adafruit_tsl2591.GAIN_LOW,     # 1x
@@ -121,44 +130,148 @@ class Publisher:
             self.backup.close()
 
 
-class Leds:
-    """Every change to either LED is published immediately, stamped right after it happens."""
+class PwmSetupError(RuntimeError):
+    """Hardware PWM isn't usable yet; the message says how to set it up."""
 
-    def __init__(self, pub, pollution_brightness=1.0, pollution_pwm=None):
+
+def find_pwm_chip(chip=None):
+    """The sysfs pwmchip of the Pi 5's RP1 PWM0 block. Its number differs between kernels,
+    so it's found by its device (…1f00098000.pwm) unless given."""
+    if chip is not None:
+        path = PWM_SYSFS / f"pwmchip{chip}"
+        if not path.exists():
+            raise PwmSetupError(f"There's no {path}.")
+        return path
+    chips = sorted(PWM_SYSFS.glob("pwmchip*"))
+    for path in chips:
+        if "98000.pwm" in str(path.resolve()):
+            return path
+    found = "\n".join(f"  {path.name} -> {path.resolve()}" for path in chips) or "  none"
+    raise PwmSetupError(
+        "Hardware PWM for the pollution LED isn't enabled. Add this line to /boot/firmware/config.txt "
+        f"and reboot:\n  {PWM_OVERLAY}\nPWM controllers found:\n{found}\n"
+        "If one of them is the right one, give its number with --pollution-pwmchip.")
+
+
+class HardwarePWM:
+    """One hardware PWM output, used like gpiozero's PWMLED: .value (0-1), .on(), .off().
+    Raspberry Pi 5 only. Setup: PWM_OVERLAY in /boot/firmware/config.txt and a reboot; and,
+    if writing to the PWM files is refused, `sudo sh setup_pwm.sh` after each boot."""
+
+    def __init__(self, gpio, frequency, chip=None):
+        if gpio not in PWM_CHANNELS:
+            raise PwmSetupError(f"GPIO {gpio} has no hardware PWM on the Pi 5. Use GPIO 12, 13, 18 or 19.")
+        self.gpio, self.channel = gpio, PWM_CHANNELS[gpio]
+        self.chip = find_pwm_chip(chip)
+        self.path = self.chip / f"pwm{self.channel}"
+        self.period_ns = round(1e9 / frequency)
+        self._value = 0.0
+        try:
+            if not self.path.exists():
+                self._write_to(self.chip / "export", self.channel)
+            deadline = time.monotonic() + 3  # a new channel takes a moment to appear and become writable
+            while not (self.path / "period").exists() or not os.access(self.path / "period", os.W_OK):
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.1)
+            # Off first, so a channel left running (say, after a crash) takes the new settings
+            self._write("enable", 0)
+            if int(self._read("duty_cycle") or 0) > self.period_ns:
+                self._write("duty_cycle", 0)
+            self._write("period", self.period_ns)
+            self._write("duty_cycle", 0)
+            self._write("enable", 1)
+        except PermissionError:
+            raise PwmSetupError(f"No permission to use hardware PWM in {self.chip}. Run this once after "
+                                f"each boot, then try again:\n  sudo sh setup_pwm.sh") from None
+        except OSError as e:
+            raise PwmSetupError(f"Couldn't set up hardware PWM channel {self.channel} in {self.chip}: {e}") from None
+        atexit.register(self.close)
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, value):
+        value = min(max(float(value), 0.0), 1.0)
+        self._write("duty_cycle", round(self.period_ns * value))
+        self._value = value
+
+    def on(self):
+        self.value = 1.0
+
+    def off(self):
+        self.value = 0.0
+
+    def close(self):
+        """Leave the LED off, since hardware PWM keeps running after the script stops."""
+        try:
+            self._write("duty_cycle", 0)
+            self._write("enable", 0)
+        except OSError:
+            pass
+
+    def _read(self, name):
+        return (self.path / name).read_text().strip()
+
+    def _write(self, name, value):
+        self._write_to(self.path / name, value)
+
+    @staticmethod
+    def _write_to(path, value):
+        with open(path, "w") as f:
+            f.write(f"{int(value)}\n")
+
+
+class Leds:
+    """Every change to either LED is published immediately, stamped right after it happens.
+    Levels are logged as actually applied, which for the test LED means whole percent."""
+
+    def __init__(self, pub, pollution_brightness=1.0, pollution_pwm="hardware",
+                 pollution_pin=POLLUTION_LED_PIN, pwmchip=None):
         self.pub = pub
-        self.test = PWMLED(TEST_LED_PIN, frequency=PWM_FREQUENCY)
         self.pollution_brightness = pollution_brightness
-        if pollution_pwm is None:
-            pollution_pwm = pollution_brightness < 1.0
-        if pollution_pwm:
-            # Dimmed with PWM. At full brightness it stays a plain on/off output.
-            self.pollution = PWMLED(POLLUTION_LED_PIN, frequency=PWM_FREQUENCY)
+        self.pollution_pwm = pollution_pwm
+        # The pollution LED first, so a PWM setup problem shows up before anything lights
+        if pollution_pwm == "hardware":
+            self.pollution = HardwarePWM(pollution_pin, PWM_FREQUENCY, pwmchip)
+        elif pollution_pwm == "software":
+            self.pollution = PWMLED(pollution_pin, frequency=PWM_FREQUENCY)
         else:
-            self.pollution = LED(POLLUTION_LED_PIN)
+            self.pollution = LED(pollution_pin)
+        self.test = PWMLED(TEST_LED_PIN, frequency=PWM_FREQUENCY)
         self.test_level = None      # unknown until the first command
         self.pollution_on = None
 
-    def set_test(self, level, note=""):
-        level = round(min(max(level, 0.0), 1.0), 4)
-        self.test.value = level
+    def describe_pollution(self):
+        if isinstance(self.pollution, HardwarePWM):
+            return f"hardware PWM, {self.pollution.path}"
+        return f"{self.pollution_pwm} PWM" if self.pollution_pwm == "software" else "on/off only"
+
+    def set_test(self, level, note="", only_if_changed=False):
+        self.test.value = round(min(max(level, 0.0), 1.0), 4)
+        applied = round(float(self.test.value), 4)  # what gpiozero actually set
+        if only_if_changed and applied == self.test_level:
+            return
         t, mono = stamp()
-        self.test_level = level
-        self.pub.send("led", {"led": "test", "level": level, "note": note}, t, mono)
+        self.test_level = applied
+        self.pub.send("led", {"led": "test", "level": applied, "note": note}, t, mono)
 
     def set_pollution(self, on, note="", level=None):
         """Switch the pollution LED on (at `level`, or the usual brightness) or off."""
         level = (self.pollution_brightness if level is None else level) if on else 0.0
-        if on and level < 1.0:
-            if not isinstance(self.pollution, PWMLED):
-                raise ValueError("dimming the pollution LED needs it set up with PWM")
-            self.pollution.value = level
-        elif on:
-            self.pollution.on()
+        if self.pollution_pwm == "none":
+            if 0 < level < 1:
+                raise ValueError("dimming the pollution LED needs --pollution-pwm hardware or software")
+            self.pollution.on() if level > 0 else self.pollution.off()
+            applied = 1.0 if level > 0 else 0.0
         else:
-            self.pollution.off()
+            self.pollution.value = level
+            applied = round(float(self.pollution.value), 4)
         t, mono = stamp()
         self.pollution_on = on
-        self.pub.send("led", {"led": "pollution", "level": level, "note": note}, t, mono)
+        self.pub.send("led", {"led": "pollution", "level": applied, "note": note}, t, mono)
 
     def all_off(self, note):
         if self.test_level != 0.0:
@@ -267,7 +380,14 @@ def main():
     p.add_argument("--test", choices=list(TESTS), required=True)
     p.add_argument("--level", type=float, default=1.0, help="test LED brightness 0-1 (default 1.0)")
     p.add_argument("--pollution-brightness", type=float, default=1.0,
-                   help="pollution LED brightness when on, 0-1 (default 1.0: plain on/off, no PWM)")
+                   help="pollution LED brightness when on, 0-1 (default 1.0)")
+    p.add_argument("--pollution-pwm", choices=["hardware", "software", "none"], default="hardware",
+                   help="how the pollution LED is driven: hardware PWM (default), gpiozero's software "
+                        "PWM, or plain on/off")
+    p.add_argument("--pollution-pin", type=int, default=POLLUTION_LED_PIN,
+                   help=f"GPIO of the pollution LED (default {POLLUTION_LED_PIN})")
+    p.add_argument("--pollution-pwmchip", type=int, default=None,
+                   help="sysfs pwmchip number for hardware PWM (default: found automatically)")
     p.add_argument("--cycles", type=int, default=5, help="repeats for steps/ramp/pollution (default 5)")
     p.add_argument("--on-seconds", type=float, default=30, help="on time per cycle (default 30)")
     p.add_argument("--off-seconds", type=float, default=30, help="off time per cycle (default 30)")
@@ -284,6 +404,8 @@ def main():
     a = p.parse_args()
     if not 0 < a.pollution_brightness <= 1:
         p.error("--pollution-brightness must be above 0 and at most 1")
+    if a.pollution_pwm == "none" and a.pollution_brightness < 1:
+        p.error("dimming the pollution LED needs --pollution-pwm hardware or software")
 
     # Never read faster than the sensor finishes a measurement
     period = max(a.period, a.integration / 1000 + 0.02)
@@ -298,6 +420,10 @@ def main():
     sensor.gain = GAINS[a.gain]
     sensor.integration_time = INTEGRATIONS[a.integration]
     time.sleep(a.integration / 1000 + 0.05)  # let the first measurement finish
+    try:
+        leds = Leds(None, a.pollution_brightness, a.pollution_pwm, a.pollution_pin, a.pollution_pwmchip)
+    except PwmSetupError as e:
+        sys.exit(str(e))
 
     pub = Publisher(a.broker, a.port, run_id, a.data_dir)
     if not pub.connected.wait(10):
@@ -309,12 +435,13 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
-    leds = Leds(pub, a.pollution_brightness)
+    leds.pub = pub
     reader = SensorReader(sensor, pub, leds, period, a.gain, a.integration)
 
     pub.send("meta", {"event": "start", "test": a.test, "settings": vars(a), "period": period,
                       "pwm_frequency": PWM_FREQUENCY, "test_led_pin": TEST_LED_PIN,
-                      "pollution_led_pin": POLLUTION_LED_PIN})
+                      "pollution_led_pin": a.pollution_pin, "pollution_pwm": leds.describe_pollution(),
+                      "led_log_levels": "applied"})
     leds.all_off("start")
     print(f"Run {run_id}: {a.dark_seconds:.0f}s dark, then the '{a.test}' test. Ctrl+C stops it.")
     reader.start()
