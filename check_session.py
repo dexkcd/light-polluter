@@ -199,9 +199,9 @@ def rig_level(name, meta, sensor):
 
 
 def earlier_reference(folder, sessions, session):
-    """From the sessions before this one (dry runs left out): the median dark reading, the median
-    settled warm-up level, and the median pollution effect at full duty."""
-    dark, warmup, pollution = [], [], []
+    """From the sessions before this one (dry runs left out): each session's dark reading, settled
+    warm-up level and pollution effect at full duty, and the median of each."""
+    found = {"dark": defaultdict(list), "warmup": defaultdict(list), "pollution": defaultdict(list)}
     for other, runs in sessions.items():
         if other >= session or is_dry_run(runs[0]["start"]):  # session names sort by time
             continue
@@ -215,20 +215,32 @@ def earlier_reference(folder, sessions, session):
             if name in ("dark", "warmup"):
                 level = rig_level(name, meta, sensor)
                 if level is not None:
-                    (dark if name == "dark" else warmup).append(level)
+                    found[name][other].append(level)
             else:
                 effect = pollution_effect(readings_with_state(sensor, read_csv(Path(folder) / f"{r['run']}_led.csv")))
                 if effect is not None:
-                    pollution.append(effect)
-    median = lambda values: statistics.median(values) if values else None
-    return {"dark": median(dark), "warmup": median(warmup), "pollution": median(pollution)}
+                    found["pollution"][other].append(effect)
+    reference = {}
+    for key, by_session in found.items():
+        per_session = [(other, statistics.median(values)) for other, values in sorted(by_session.items())]
+        reference[key] = statistics.median(v for _, v in per_session) if per_session else None
+        reference[key + "_by_session"] = per_session
+    return reference
 
 
-def compare_full_duty(added, before, label, problems):
+def fmt_earlier(earlier, key, last=6):
+    """The earlier sessions' values, newest last, so a change shows up where it happened."""
+    per_session = earlier[key + "_by_session"][-last:]
+    return ", ".join(f"{value:.1f} ({other})" for other, value in per_session)
+
+
+def compare_full_duty(added, earlier, label, problems):
     """Full duty should add about as much as the pollution LED did in earlier sessions."""
+    before = earlier["pollution"]
     if before is None:
         return
-    print(f"  at full duty it adds {added:.1f} counts; earlier sessions: {before:.1f}")
+    print(f"  at full duty it adds {added:.1f} counts; earlier sessions: median {before:.1f}")
+    print(f"    by session: {fmt_earlier(earlier, 'pollution')}")
     if abs(added - before) > max(3, 0.15 * before):
         problems.append(f"{label}: at full duty the pollution LED adds {added:.1f} counts, against {before:.1f} "
                         f"in earlier sessions. Check its wiring and that nothing moved.")
@@ -397,12 +409,16 @@ def main():
             problems.append(f"{name}: {saturated} reading(s) saturated.")
 
         rows = readings_with_state(sensor, led)
-        for pol, spread in spread_by_pollution(rows).items():
-            spreads[pol].append(spread)
+        if meta.get("pollution_level") in ("low", "high", "check"):
+            # Only runs where the pollution LED switches, so "off" means the same conditions as "on";
+            # a warm-up's slow drift would otherwise look like noise
+            for pol, spread in spread_by_pollution(rows).items():
+                spreads[pol].append(spread)
         if name in ("dark", "warmup"):
             rig[name] = rig_level(name, meta, sensor)
         if meta.get("change") == "pollution_check":
-            checks.append((name, meta, effect_by_brightness(rows), r["run"], sensor, led))
+            off_noise = spread_by_pollution(rows).get(0.0)
+            checks.append((name, meta, effect_by_brightness(rows), r["run"], sensor, led, off_noise))
         elif meta.get("pollution_level") in ("low", "high"):
             effect = pollution_effect(rows)
             if effect is not None:
@@ -418,19 +434,25 @@ def main():
         print("\nRig check, against the earlier sessions:")
         if "dark" in rig and rig["dark"] is not None:
             before = earlier["dark"]
-            print(f"  dark: {rig['dark']:.1f} counts" + (f" (earlier sessions: {before:.1f})" if before is not None else ""))
+            print(f"  dark: {rig['dark']:.1f} counts" + (f" (earlier sessions: median {before:.1f})" if before is not None else ""))
+            if before is not None:
+                print(f"    by session: {fmt_earlier(earlier, 'dark')}")
             if before is not None and abs(rig["dark"] - before) > 3:
                 problems.append(f"The dark reading ({rig['dark']:.1f} counts) differs from the earlier sessions "
                                 f"({before:.1f}). Is the box still sealed and nothing moved?")
         if "warmup" in rig and rig["warmup"] is not None:
             before = earlier["warmup"]
             print(f"  warm-up, last minute: {rig['warmup']:.1f} counts"
-                  + (f" (earlier 5-minute warm-ups: {before:.1f})" if before is not None else ""))
+                  + (f" (earlier 5-minute warm-ups: median {before:.1f})" if before is not None else ""))
+            if before is not None:
+                print(f"    by session: {fmt_earlier(earlier, 'warmup')}")
             if before is not None and abs(rig["warmup"] - before) > 0.02 * before:
                 problems.append(f"The settled warm-up level ({rig['warmup']:.1f} counts) is more than 2 % from the "
                                 f"earlier sessions ({before:.1f}). Did the sensor or the test LED move?")
 
-    for name, meta, by_level, *_ in checks:
+    for name, meta, by_level, _, _, _, off_noise in checks:
+        # A change counts as clear if it's well above the readings' own noise (at least 1 count)
+        clear = max(1.0, 2 * off_noise) if off_noise is not None else 2.0
         print(f"\nPollution check ({name}): counts the pollution LED adds at each brightness, against its")
         print(f"off periods, with the test LED at {meta['brightness'][0]}.")
         checked = meta.get("pollution_brightness") or []
@@ -446,17 +468,17 @@ def main():
                 share = (f"  ({100 * by_level[level] / by_level[top]:.0f} % of the effect at {top}; "
                          f"about {expected:.1f} if light follows brightness)")
             print(f"  brightness {level}: adds {by_level[level]:.1f} counts{share}")
-            if by_level[level] <= 2:
+            if by_level[level] <= clear:
                 problems.append(f"{name}: at brightness {level} the pollution LED hardly changes the "
                                 f"reading ({by_level[level]:.1f} counts). Is it wired and pointing into the box?")
         levels = sorted(by_level)
         for low, high in zip(levels, levels[1:]):
-            if by_level[high] - by_level[low] < 2:
+            if by_level[high] - by_level[low] < clear:
                 problems.append(f"{name}: the pollution LED gives about the same light at brightness {low} "
                                 f"({by_level[low]:.1f} counts) as at {high} ({by_level[high]:.1f} counts). "
                                 f"Its brightness setting isn't changing its light.")
         if 1.0 in by_level:
-            compare_full_duty(by_level[1.0], earlier["pollution"], name, problems)
+            compare_full_duty(by_level[1.0], earlier, name, problems)
 
     # ---- Pollution effect at each duty, from the session's steps runs ----
     pollution = {duty: statistics.median(found) for duty, found in effects.items() if not isinstance(duty, list)}
@@ -473,7 +495,7 @@ def main():
         duty, added = next(iter(pollution.items()))
         print(f"\nThe pollution LED adds about {added:.1f} counts (median over this session's pollution runs).")
     if 1.0 in pollution:
-        compare_full_duty(pollution[1.0], earlier["pollution"], "This session", problems)
+        compare_full_duty(pollution[1.0], earlier, "This session", problems)
 
     if results:
         print("\nStep sizes: median counts at each test LED level, pollution LED off, leaving out readings")
@@ -491,7 +513,8 @@ def main():
     # ---- No flicker: spread within steady stretches, pollution off and at each duty ----
     spread = {pol: statistics.median(found) for pol, found in spreads.items()}
     if spread and any(pol > 0 for pol in spread):
-        print("\nNoise: how much readings vary within steady stretches (standard deviation, counts):")
+        print("\nNoise: how much readings vary within steady stretches of the pollution runs")
+        print("(standard deviation, counts):")
         print("  " + "   ".join(("pollution off" if pol == 0 else f"duty {pol}") + f": {value:.1f}"
                                 for pol, value in sorted(spread.items())))
         off = spread.get(0.0)
@@ -512,7 +535,7 @@ def main():
                 title = run if step is None else f"{run}    step about {step:.0f} counts"
                 if plot_run(path, run, sensor, led, title):
                     saved.append(str(path))
-            for name, meta, by_level, run, sensor, led in checks:
+            for name, meta, by_level, run, sensor, led, _ in checks:
                 path = Path(a.data_dir) / f"{run}_plot.png"
                 added = ", ".join(f"{level}: +{count:.0f}" for level, count in sorted(by_level.items(), reverse=True))
                 if plot_run(path, run, sensor, led, f"{run}    {added} counts", lower="pollution"):
