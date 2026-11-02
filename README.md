@@ -165,9 +165,9 @@ The project has two services, both built from this repo:
 | Service | Built from | Settings |
 | --- | --- | --- |
 | `broker` | `cloud/broker/Dockerfile` | `MQTT_PI_PASSWORD`, `MQTT_APP_PASSWORD`, `MQTT_LAPTOP_PASSWORD`, `MQTT_MOCK_PASSWORD`, `PORT=8080`; a public domain on port 8080 |
-| `app` | `cloud/app/Dockerfile` | `APP_USERNAME`, `APP_PASSWORD` (the login), `SESSION_SECRET`, `MQTT_URL` (the broker's `wss://` address), the broker passwords as references to the broker's variables; a volume at `/data`; a public domain |
+| `web` | `cloud/app/Dockerfile` | `APP_USERNAME`, `APP_PASSWORD` (the login), `SESSION_SECRET`, `MQTT_URL` (the broker's `wss://` address), the broker passwords as references to the broker's variables; a volume at `/data`; a public domain |
 
-Pushing to `main` redeploys both. To change the login, change `APP_USERNAME` or `APP_PASSWORD` on the app service.
+Both run in Railway's Amsterdam region. Pushing to `main` redeploys whichever service's files changed. To change the login, change `APP_USERNAME` or `APP_PASSWORD` on the `web` service.
 
 To run the web app on a laptop instead: start the broker with `cloud/broker/entrypoint.sh` (set its variables and `MOSQUITTO_CONF_DIR`), then from this folder:
 
