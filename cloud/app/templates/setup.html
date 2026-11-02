@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Setup – Light rig{% endblock %}
+{% block main %}
+<section class="narrow">
+  {% if mock %}<p class="flash-inline">The mock rig needs no setup: it runs inside the web app. This page is about the real Pi.</p>{% endif %}
+  <h1>Connect the Pi</h1>
+  <p>Once, on the Pi. Afterwards it connects by itself at every boot, and the header here says <em>Pi online</em>.</p>
+
+  <ol class="steps">
+    <li>
+      <h2>Get the latest code</h2>
+      <pre class="code">cd ~/light-polluter
+git pull</pre>
+    </li>
+    <li>
+      <h2>Save the broker settings</h2>
+      <p>Put these lines in <code>~/.config/light-polluter/rig.env</code>. Every script reads them, so <code>--broker</code> isn't needed any more.</p>
+      <pre class="code secret" id="pi-env" data-secret="{{ pi_env }}">{{ pi_env.replace(pi_env.split("RIG_MQTT_PASSWORD=")[1].strip(), "••••••••") if has_pi_password else pi_env }}</pre>
+      <div class="actions">
+        <button type="button" class="quiet" data-copy="pi-env">Copy</button>
+        {% if has_pi_password %}<button type="button" class="quiet" data-reveal="pi-env">Show password</button>{% endif %}
+      </div>
+      {% if not has_pi_password %}<p class="error">MQTT_PI_PASSWORD isn't set on the app, so the password is missing here. It's on the broker service in Railway.</p>{% endif %}
+      <pre class="code">mkdir -p ~/.config/light-polluter
+nano ~/.config/light-polluter/rig.env      # paste, then Ctrl+O, Enter, Ctrl+X
+chmod 600 ~/.config/light-polluter/rig.env</pre>
+    </li>
+    <li>
+      <h2>Install the agent</h2>
+      <p>It runs in the background, starts at boot, and starts and stops sessions when you ask here. It also sets up the pollution LED's hardware PWM at boot, so <code>sudo sh setup_pwm.sh</code> isn't needed any more.</p>
+      <pre class="code">sh pi/install_agent.sh</pre>
+      <p class="hint">Its log: <code>journalctl -u rig-agent -f</code>. After a <code>git pull</code>, restart it with <code>sudo systemctl restart rig-agent</code>; a running session keeps going.</p>
+    </li>
+  </ol>
+
+  <h2>Scripts started by hand</h2>
+  <p>They still work, and their data comes here too: <code>python session.py --plan pollution-check</code> on the Pi, with no <code>--broker</code>. The Live page shows them, and can stop them.</p>
+
+  {% if laptop_env %}
+  <h2>Logger on a laptop</h2>
+  <p>Optional: to keep a copy on the laptop as well, put these in the laptop's <code>~/.config/light-polluter/rig.env</code> and run <code>python logger.py</code>.</p>
+  <pre class="code secret" id="laptop-env" data-secret="{{ laptop_env }}">{{ laptop_env.replace(laptop_env.split("RIG_MQTT_PASSWORD=")[1].strip(), "••••••••") }}</pre>
+  <div class="actions">
+    <button type="button" class="quiet" data-copy="laptop-env">Copy</button>
+    <button type="button" class="quiet" data-reveal="laptop-env">Show password</button>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

@@ -22,7 +22,9 @@ import json
 import time
 from pathlib import Path
 
-import paho.mqtt.client as mqtt
+import os
+
+import mqtt_link
 
 FIELDS = {
     "sensor": ["seq", "t", "mono", "ch0_full", "ch1_ir", "saturated", "gain",
@@ -92,12 +94,19 @@ class RunFiles:
         self.open.clear()
 
 
+DATA_STREAMS = ["sensor", "led", "meta"]
+
+
 def main():
+    mqtt_link.load_env_file()
     p = argparse.ArgumentParser(description="Light sensor rig: laptop logger")
-    p.add_argument("--broker", default="localhost", help="broker address (default: this laptop)")
-    p.add_argument("--port", type=int, default=1883)
+    p.add_argument("--broker", default=None,
+                   help="broker address (default: RIG_BROKER, or this laptop). For the cloud broker, "
+                        "wss://... with RIG_MQTT_USERNAME and RIG_MQTT_PASSWORD set")
+    p.add_argument("--port", type=int, default=None, help="broker port, if not the usual one for the address")
     p.add_argument("--data-dir", default="data", help="folder for the CSV files (default: data)")
     a = p.parse_args()
+    a.broker = a.broker or os.environ.get("RIG_BROKER") or "localhost"
 
     files = RunFiles(a.data_dir)
 
@@ -105,8 +114,8 @@ def main():
         if reason_code.is_failure:
             print(f"Broker refused the connection: {reason_code}")
             return
-        client.subscribe("rig/#", qos=1)
-        print(f"Listening on {a.broker}:{a.port}. Saving to {Path(a.data_dir).resolve()}")
+        client.subscribe([(mqtt_link.topic(stream), 1) for stream in DATA_STREAMS])
+        print(f"Listening on {mqtt_link.describe(a.broker, a.port)}. Saving to {Path(a.data_dir).resolve()}")
         print("Waiting for the Pi... (Ctrl+C to quit)")
 
     def on_message(client, userdata, message):
@@ -117,14 +126,14 @@ def main():
         except (ValueError, KeyError) as e:
             print(f"Skipped a message on {message.topic} I couldn't read: {e}")
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="light-rig-logger")
+    client, settings = mqtt_link.make_client("light-rig-logger", a.broker, a.port)
     client.on_connect = on_connect
     client.on_message = on_message
     try:
-        client.connect(a.broker, a.port, keepalive=30)
+        client.connect(settings.host, settings.port, keepalive=30)
     except OSError as e:
-        raise SystemExit(f"Can't reach the broker at {a.broker}:{a.port} ({e}). "
-                         f"Start Mosquitto first: mosquitto -c mosquitto.conf -v")
+        raise SystemExit(f"Can't reach the broker at {mqtt_link.describe(a.broker, a.port)} ({e}). "
+                         f"For the laptop broker, start Mosquitto first: mosquitto -c mosquitto.conf -v")
     try:
         client.loop_forever()
     except KeyboardInterrupt:

@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}Light rig{% endblock %}
+{% block head %}<link rel="stylesheet" href="/static/vendor/uPlot.min.css">{% endblock %}
+{% block main %}
+<section class="live" aria-labelledby="live-heading">
+  <div class="readout">
+    <h1 id="live-heading" class="readout-label">Sensor reading</h1>
+    <p class="readout-value"><span id="full">–</span><span class="unit">counts</span></p>
+    <p class="readout-note" id="reading-note">Waiting for readings</p>
+    <dl class="levels">
+      <div><dt><span class="swatch swatch-test"></span>Test LED</dt><dd id="test-level">–</dd></div>
+      <div><dt><span class="swatch swatch-pollution"></span>Pollution LED</dt><dd id="pollution-level">–</dd></div>
+      <div><dt>Infrared</dt><dd id="ir">–</dd></div>
+    </dl>
+  </div>
+  <div class="charts">
+    <p class="chart-head"><span><span class="swatch swatch-counts"></span>Sensor counts, last 15 minutes</span><span class="chart-hover" id="hover-counts"></span></p>
+    <div class="chart" id="chart-counts" role="img" aria-label="Sensor counts over the last 15 minutes"></div>
+    <p class="chart-head"><span><span class="swatch swatch-test"></span>Test LED</span><span><span class="swatch swatch-pollution"></span>Pollution LED</span><span class="chart-hover" id="hover-leds"></span></p>
+    <div class="chart" id="chart-leds" role="img" aria-label="Test LED and pollution LED levels over the last 15 minutes"></div>
+    <p class="chart-empty" id="chart-empty">No readings in the last 15 minutes. They appear here as soon as a session or test runs on the Pi.</p>
+  </div>
+</section>
+
+<div class="work">
+<section class="control" aria-live="polite">
+  <div id="running" hidden>
+    <h2 id="running-title">Session running</h2>
+    <p class="running-now" id="running-now"></p>
+    <div class="timeline" id="timeline"></div>
+    <div class="legend" id="timeline-legend"></div>
+    <p class="running-times" id="running-times"></p>
+    <div class="actions">
+      <button class="stop" id="stop" type="button">Stop session</button>
+      <button class="quiet" id="stop-cancel" type="button" hidden>Keep it running</button>
+    </div>
+    <p class="hint" id="stop-hint">Stopping ends the current run early and switches both LEDs off. Finished runs are kept.</p>
+    <p class="error" id="stop-error" role="alert"></p>
+  </div>
+
+  <div id="busy" hidden>
+    <h2>A script started on the Pi is running</h2>
+    <p><code id="busy-command"></code></p>
+    <p>It sends its data here as usual. Starting a session from here waits until it's done.</p>
+    <div class="actions">
+      <button class="stop" id="busy-stop" type="button">Stop it</button>
+      <button class="quiet" id="busy-cancel" type="button" hidden>Keep it running</button>
+    </div>
+    <p class="error" id="busy-error" role="alert"></p>
+  </div>
+
+  <form id="start-form" novalidate>
+    <h2>Start a session</h2>
+    <fieldset class="plans">
+      <legend>Plan</legend>
+      {% for p in catalog.plans %}
+      <label class="plan">
+        <input type="radio" name="plan" value="{{ p.name }}" {% if loop.first %}checked{% endif %}>
+        <span class="plan-name">{{ p.name }}</span>
+        <span class="plan-info">{{ p.info }}</span>
+      </label>
+      {% endfor %}
+    </fieldset>
+
+    <fieldset class="runs">
+      <legend>Runs <span class="legend-actions"><button type="button" class="quiet small" id="runs-all">All</button><button type="button" class="quiet small" id="runs-none">None</button></span></legend>
+      <div class="run-list" id="run-list"></div>
+      <p class="hint">Untick runs to leave them out. To finish an interrupted session, tick the runs still to do and enter its seed below.</p>
+    </fieldset>
+
+    <div class="fields two">
+      <label>Session seed
+        <input name="seed" inputmode="numeric" placeholder="A new one">
+        <span class="hint">Leave empty for a new seed. Reuse one only to finish an interrupted session.</span>
+      </label>
+      <label>Time scale
+        <input name="time_scale" inputmode="decimal" placeholder="1">
+        <span class="hint">1 for a real session. 0.05 runs every duration 20 times faster, for a dry run.</span>
+      </label>
+    </div>
+
+    <details class="more">
+      <summary>All options</summary>
+      <p class="hint">Empty fields use session.py's defaults. Lists are separated by spaces.</p>
+      {% for g in catalog.groups %}
+      <fieldset class="group">
+        <legend>{{ g.title }}</legend>
+        <div class="fields">
+        {% for f in g.fields %}
+          <label>{{ f.flag }}
+            {% if f.choices %}
+            <select name="{{ f.name }}" data-option>
+              <option value="">default{% if f.default is not none %} ({{ f.default }}){% endif %}</option>
+              {% for c in f.choices %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+            </select>
+            {% else %}
+            <input name="{{ f.name }}" data-option {% if f.nargs %}data-list{% endif %} {% if f.number and not f.nargs %}inputmode="decimal"{% endif %}
+                   placeholder="{{ f.default if f.default is not none else 'default' }}">
+            {% endif %}
+            {% if f.help %}<span class="hint">{{ f.help }}</span>{% endif %}
+          </label>
+        {% endfor %}
+        </div>
+      </fieldset>
+      {% endfor %}
+    </details>
+
+    <div class="preview" id="preview">
+      <h3>What will run</h3>
+      <div class="timeline" id="preview-timeline"></div>
+      <div class="legend" id="preview-legend"></div>
+      <p class="preview-total" id="preview-total"></p>
+      <div class="table-wrap">
+      <table class="runs-table">
+        <thead><tr><th scope="col">#</th><th scope="col">Run</th><th scope="col" class="num">Length</th><th scope="col">Test LED</th><th scope="col">Pollution</th></tr></thead>
+        <tbody id="preview-rows"></tbody>
+      </table>
+      </div>
+    </div>
+
+    <p class="error" id="start-error" role="alert"></p>
+    <div class="actions">
+      <button class="primary" id="start" type="submit">Start session</button>
+      <button class="quiet" id="start-cancel" type="button" hidden>Cancel</button>
+    </div>
+    <p class="hint" id="start-hint"></p>
+  </form>
+  <p class="last" id="last-result"></p>
+</section>
+
+<section class="console-panel" aria-labelledby="console-heading">
+  <h2 id="console-heading">Pi console</h2>
+  <p class="hint">What session.py prints on the Pi, as it happens.</p>
+  <pre class="console" id="console" tabindex="0"></pre>
+</section>
+</div>
+<script type="application/json" id="catalog">{{ catalog | tojson }}</script>
+{% endblock %}
+{% block scripts %}
+<script src="/static/vendor/uPlot.iife.min.js"></script>
+<script src="/static/dashboard.js?v=6"></script>
+{% endblock %}

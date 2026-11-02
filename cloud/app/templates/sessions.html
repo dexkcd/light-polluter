@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Sessions – Light rig{% endblock %}
+{% block main %}
+<section class="page-head">
+  <h1>Sessions</h1>
+  <a class="button" href="/download/all">Download all data (.zip)</a>
+</section>
+
+{% if sessions %}
+<div class="table-wrap">
+<table class="list">
+  <thead><tr><th scope="col">Started</th><th scope="col">Plan</th><th scope="col" class="num">Seed</th>
+    <th scope="col" class="num">Runs finished</th><th scope="col" class="num">Size</th><th scope="col">Notes</th></tr></thead>
+  <tbody>
+  {% for s in sessions %}
+  <tr>
+    <td><a href="/sessions/{{ s.id }}">{{ s.when }}</a></td>
+    <td>{{ s.plan }}</td>
+    <td class="num">{{ s.seed }}</td>
+    <td class="num">{{ s.finished }} of {{ s.runs }}</td>
+    <td class="num">{{ s.size | size }}</td>
+    <td>{% if s.dry_run %}<span class="tag">Dry run</span>{% endif %}{% if s.partial %}<span class="tag">Some runs only</span>{% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No sessions yet. Start one on the <a href="/">Live</a> page, or add the laptop's earlier data below.</p>
+{% endif %}
+
+{% if tests %}
+<h2>Single tests</h2>
+<p class="hint">Runs from rig.py, one test each.</p>
+<div class="table-wrap">
+<table class="list">
+  <thead><tr><th scope="col">Started</th><th scope="col">Test</th><th scope="col">Status</th><th scope="col">Files</th></tr></thead>
+  <tbody>
+  {% for t in tests %}
+  <tr><td>{{ t.when }}</td><td>{{ t.test }}</td><td>{{ t.status }}</td>
+    <td class="files">{% for f in t.files %}<a href="/files/{{ f }}">{{ f.split("_")[-1] }}</a>{% endfor %}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+
+<section class="upload">
+  <h2>Add earlier data</h2>
+  <p>Upload the files logger.py wrote on the laptop (<code>data/</code>), so every session is in one place and the checks can compare against them. Pick the CSV and JSONL files, or one .zip of the folder. Files already here are left as they are.</p>
+  <form method="post" action="/upload" enctype="multipart/form-data" class="upload-form">
+    <input type="file" name="files" multiple accept=".csv,.jsonl,.zip" required>
+    <button class="primary">Upload</button>
+  </form>
+</section>
+{% endblock %}

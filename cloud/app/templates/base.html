@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Light rig{% endblock %}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@300;400;600;700&display=swap">
+<link rel="stylesheet" href="/static/app.css?v=6">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+{% block head %}{% endblock %}
+</head>
+<body class="page-{{ page }}{% if mock %} is-mock{% endif %}" data-mock="{{ 1 if mock else 0 }}">
+{% macro pi_label(state) -%}
+{{ "Mock Pi" if mock else "Pi" }} {{ {"idle": "online", "running": "running a session", "stopping": "stopping the session",
+    "busy": "busy with a script started on it"}.get(state, "offline") }}
+{%- endmacro %}
+<header class="top">
+  <a class="mark" href="/"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="1.5" y="1.5" width="17" height="17" rx="3"/><circle cx="7" cy="10" r="3"/><path d="M12.5 10h4"/></svg>Light rig</a>
+  <nav aria-label="Main">
+    <a href="/" {% if page == "dashboard" %}aria-current="page"{% endif %}>Live</a>
+    <a href="/sessions" {% if page in ("sessions", "session") %}aria-current="page"{% endif %}>Sessions</a>
+    <a href="/setup" {% if page == "setup" %}aria-current="page"{% endif %}>Setup</a>
+  </nav>
+  <span class="pi" id="pi-status" data-state="{{ status.state if status.state in ('idle', 'running', 'stopping', 'busy') else 'offline' }}">{{ pi_label(status.state) }}</span>
+  {% if mock_available %}
+  <form method="post" action="/mode" class="mode">
+    <input type="hidden" name="mock" value="{{ 0 if mock else 1 }}"><input type="hidden" name="next" value="{{ path }}">
+    <button class="switch" role="switch" aria-checked="{{ 'true' if mock else 'false' }}"><span class="switch-track"></span>Mock rig</button>
+  </form>
+  {% endif %}
+  <form method="post" action="/logout" class="logout"><button class="quiet">Log out</button></form>
+</header>
+{% if mock %}<p class="mock-banner">You're on the mock rig: a simulated Pi in the cloud with a simulated sensor and LEDs. Its sessions and data are kept apart from the real rig's.</p>{% endif %}
+{% if flash %}<p class="flash" role="status">{{ flash }}</p>{% endif %}
+<main>
+{% block main %}{% endblock %}
+</main>
+<script src="/static/app.js?v=6"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

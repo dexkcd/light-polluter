@@ -7,7 +7,7 @@ The Pi never analyses anything while it runs. It records two things, each with a
 - what the sensor saw
 - what brightness it just told each LED to be
 
-The laptop logs both streams to CSV, and all analysis happens afterwards on the saved files.
+Both streams are saved as CSV files, and all analysis happens afterwards on the saved files. The [web app](#web-app) saves them in the cloud and lets you start and stop sessions from a browser; the laptop logger still works as before.
 
 ## Files
 
@@ -19,6 +19,12 @@ The laptop logs both streams to CSV, and all analysis happens afterwards on the 
 | `check_session.py` | Laptop | Checks a session's data: every run finished, brightness matches the LED log, seeds and sensor settings, step sizes in counts (see [Checking a session](#checking-a-session)) |
 | `logger.py` | Laptop | Subscribes to the broker and writes one set of CSV files per run |
 | `mosquitto.conf` | Laptop | Lets the Pi connect to the Mosquitto broker over the local network |
+| `mqtt_link.py` | Everywhere | How every script reaches the broker: its address, username and password come from `~/.config/light-polluter/rig.env` |
+| `pi_agent.py` | Pi | Always-on service: starts and stops sessions when asked from the web app (see [Web app](#web-app)) |
+| `pi/install_agent.sh` | Pi | Installs the agent, and the hardware PWM setup at boot, as services |
+| `cloud/app/` | Railway | The web app: login, live readings, start and stop, sessions, downloads, checks |
+| `cloud/broker/` | Railway | The cloud MQTT broker, with a username and password for each part of the system |
+| `mock_rig/` | Railway | A simulated sensor and LEDs, for the web app's mock rig |
 
 ## Wiring
 
@@ -105,6 +111,70 @@ python rig.py --broker <laptop IP> --test steps --cycles 2 --on-seconds 5 --off-
 ```
 
 Then open the CSVs in `data/` and check that both sensor readings and LED events are appearing.
+
+## Web app
+
+The web app runs the rig from a browser, from anywhere:
+
+- **Live**: the sensor reading and both LED levels as they happen, the last 15 minutes as charts, and what session.py prints on the Pi.
+- **Start a session**: pick the plan, untick runs to leave out, set any option session.py takes (with its own checks), and see what will run and for how long before starting. While it runs, a timeline shows each run, the current one, and when it'll be done. **Stop** ends the current run early and switches both LEDs off, like Ctrl+C.
+- **Sessions**: every session's files, in the same format logger.py writes (one file each, a zip per session, or everything), the checks from check_session.py with a plot of each run, and **Fill gaps from the Pi's backup** if anything didn't arrive. **Add earlier data** takes the laptop's `data/` folder (as files or one zip), so the checks can compare new sessions with the earlier ones.
+- **Mock rig**: a simulated Pi with a simulated sensor and LEDs, switched on in the header, for trying things without the rig. Its sessions and data are kept apart from the real ones, and its runs are marked `"mock": true` in their meta files.
+
+How the parts connect:
+
+```
+Pi:  session.py / rig.py  ── readings, LED events ──▶  cloud broker  ──▶  web app  ──▶  CSV files in the cloud
+Pi:  pi_agent.py          ◀──── start / stop ───────  (MQTT over        ◀──  browser
+                          ──── status, console ────▶   secure WebSockets)
+```
+
+The Pi still keeps its backup of every message in `~/rig-data`, and the web app keeps a persistent session with the broker, so a restart of the app (an update, say) doesn't lose readings: the broker holds them until the app is back.
+
+### Connecting the Pi
+
+The web app's **Setup** page has the lines to paste and the commands. In short, on the Pi:
+
+```
+cd ~/light-polluter && git pull
+nano ~/.config/light-polluter/rig.env     # RIG_BROKER, RIG_MQTT_USERNAME=pi, RIG_MQTT_PASSWORD (from the Setup page)
+sh pi/install_agent.sh
+```
+
+After that, every script reads the broker from `rig.env`, so `--broker` isn't needed: `python session.py --plan pollution-check` sends its data to the web app too, and the Live page shows it and can stop it. To go back to the laptop broker, set `RIG_BROKER` to the laptop's IP address and leave the username and password empty, or give `--broker <laptop IP>`.
+
+The agent runs as the `rig-agent` service and starts at boot; its log is `journalctl -u rig-agent -f`. After a `git pull`, `sudo systemctl restart rig-agent` loads the new code; a running session keeps going and the new agent picks it up. `install_agent.sh` also adds `rig-pwm`, which runs `setup_pwm.sh` at boot.
+
+Only one rig script can drive the LEDs at a time: a second one, started by hand or from the web app, stops with a message saying what's already running.
+
+### Broker users
+
+| User | Can | Used by |
+| --- | --- | --- |
+| `pi` | send `rig/sensor`, `rig/led`, `rig/meta`, `rig/agent/...`; receive `rig/cmd` | the Pi |
+| `app` | receive everything; send `rig/cmd` and `mock/cmd` | the web app |
+| `laptop` | receive `rig/sensor`, `rig/led`, `rig/meta` | logger.py on a laptop (optional) |
+| `mock` | the same as `pi`, but on `mock/...` | the mock rig |
+
+Each one has its own password, set on the broker service. Only the web app can send commands to the Pi, and only the Pi can send data. To keep a copy on a laptop as well, put the `laptop` user's lines from the Setup page in the laptop's `~/.config/light-polluter/rig.env` and run `python logger.py`.
+
+### On Railway
+
+The project has two services, both built from this repo:
+
+| Service | Built from | Settings |
+| --- | --- | --- |
+| `broker` | `cloud/broker/Dockerfile` | `MQTT_PI_PASSWORD`, `MQTT_APP_PASSWORD`, `MQTT_LAPTOP_PASSWORD`, `MQTT_MOCK_PASSWORD`, `PORT=8080`; a public domain on port 8080 |
+| `app` | `cloud/app/Dockerfile` | `APP_USERNAME`, `APP_PASSWORD` (the login), `SESSION_SECRET`, `MQTT_URL` (the broker's `wss://` address), the broker passwords as references to the broker's variables; a volume at `/data`; a public domain |
+
+Pushing to `main` redeploys both. To change the login, change `APP_USERNAME` or `APP_PASSWORD` on the app service.
+
+To run the web app on a laptop instead: start the broker with `cloud/broker/entrypoint.sh` (set its variables and `MOSQUITTO_CONF_DIR`), then from this folder:
+
+```
+APP_USERNAME=me APP_PASSWORD=... MQTT_URL=ws://localhost:8080/ MQTT_APP_PASSWORD=... INSECURE_COOKIES=1 \
+  PYTHONPATH=.:cloud uvicorn app.main:app --port 8000
+```
 
 ## Tests
 

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log in to Light rig</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@300;400;600;700&display=swap">
+<link rel="stylesheet" href="/static/app.css?v=6">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+</head>
+<body class="page-login">
+<main class="login">
+  <form method="post" action="/login" class="login-form">
+    <h1><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="1.5" y="1.5" width="17" height="17" rx="3"/><circle cx="7" cy="10" r="3"/><path d="M12.5 10h4"/></svg>Light rig</h1>
+    <p class="lede">The sensor box's console: live readings, sessions and data.</p>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <label>Username <input name="username" autocomplete="username" required autofocus></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <input type="hidden" name="next" value="{{ next }}">
+    <button class="primary">Log in</button>
+  </form>
+</main>
+</body>
+</html>

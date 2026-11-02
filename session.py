@@ -63,6 +63,11 @@ backups on the Pi), and each run's own seeds are derived from it and saved in
 its meta file. Every LED command is logged with its exact time, including each
 run's first command even when it leaves the LED where it was.
 
+The broker is --broker or RIG_BROKER: the laptop's address, or the cloud broker
+(wss://...), with its username and password in the environment or in
+~/.config/light-polluter/rig.env (see mqtt_link.py). Sessions can also be started
+and stopped from the web app, through pi_agent.py.
+
 Examples:
     python session.py --plan small-steps --list
     python session.py --plan small-steps --broker 192.168.50.157 --time-scale 0.05   # ~4 min dry run
@@ -75,12 +80,15 @@ Examples:
 import argparse
 import itertools
 import json
+import os
 import random
 import signal
 import sys
 import threading
 import time
 from pathlib import Path
+
+import mqtt_link
 
 # Each run: number, name, default minutes, option that sets the minutes, what the test LED
 # does, pollution level, option holding the two step levels (alternate runs only), purpose
@@ -414,15 +422,29 @@ def describe_levels(a, row):
     return " / ".join(str(level) for level in levels)
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Light sensor rig: experiment sessions")
+class OptionError(ValueError):
+    """A problem with the options, raised instead of exiting when parse_args(raise_errors=True)."""
+
+
+class _Parser(argparse.ArgumentParser):
+    raise_errors = False
+
+    def error(self, message):
+        if self.raise_errors:
+            raise OptionError(message)
+        super().error(message)
+
+
+def build_parser():
+    p = _Parser(description="Light sensor rig: experiment sessions")
     p.add_argument("--plan", choices=list(PLANS), required=True,
                    help="main: sessions 1-2 (runs 1-10); small-steps: sessions 3-4 (runs 11-18); "
                         "pollution-levels: the pollution-levels block (runs 21-43); "
                         "pollution-levels-test: the check before that block; "
                         "pollution-check: a quick check of the pollution LED's brightness")
-    p.add_argument("--broker", help="the laptop's IP address, e.g. 192.168.50.157")
-    p.add_argument("--port", type=int, default=1883)
+    p.add_argument("--broker", default=os.environ.get("RIG_BROKER"),
+                   help="broker address: the laptop's IP, or the cloud broker wss://... (default: RIG_BROKER)")
+    p.add_argument("--port", type=int, default=None, help="broker port, if not the usual one for the address")
     p.add_argument("--list", action="store_true", help="print the plan and exit")
     p.add_argument("--only", nargs="+", choices=ALL_NAMES, metavar="RUN", help="run just these runs, in plan order")
     p.add_argument("--skip", nargs="+", choices=ALL_NAMES, metavar="RUN", default=[], help="leave these runs out")
@@ -493,8 +515,15 @@ def parse_args():
     g.add_argument("--integration", type=int, choices=[100, 200, 300, 400, 500, 600], default=100)
     g.add_argument("--period", type=float, default=1.0, help="seconds between readings (default 1.0)")
     g.add_argument("--data-dir", default=None, help="where the Pi's backup copy goes (default ~/rig-data)")
+    return p
 
-    a = p.parse_args()
+
+def parse_args(argv=None, raise_errors=False):
+    """The session's options. With raise_errors, a bad option raises OptionError instead of
+    exiting, so the Pi agent and the web app can check options with the same rules."""
+    p = build_parser()
+    p.raise_errors = raise_errors
+    a = p.parse_args(argv)
     if a.check_levels is None:
         a.check_levels = list(POLLUTION_DUTIES) if a.plan == "pollution-levels-test" else [1.0, 0.5]
     if a.check_test_level is None:
@@ -534,6 +563,42 @@ def parse_args():
     return a
 
 
+# Options the web app can't set: the Pi agent supplies the broker and data folder itself
+NOT_FROM_APP = {"help", "plan", "broker", "port", "list", "data_dir"}
+
+
+def argv_from_options(plan, options):
+    """session.py's command line for a plan and a dict of its options, keyed by their long names
+    with _ for - (e.g. {"block_order": "95-first", "only": ["warmup", "steps95_clean"]}).
+    Used by the web app and the Pi agent; raises OptionError for anything session.py doesn't take."""
+    if plan not in PLANS:
+        raise OptionError(f"unknown plan '{plan}'")
+    if not isinstance(options, dict):
+        raise OptionError("options must be a JSON object")
+    actions = {action.dest: action for action in build_parser()._actions if action.option_strings}
+    argv = ["--plan", plan]
+    for key, value in options.items():
+        action = actions.get(key)
+        if action is None or key in NOT_FROM_APP:
+            raise OptionError(f"'{key}' can't be set from the app")
+        flag = max(action.option_strings, key=len)
+        if action.nargs == 0:  # an on/off switch
+            if value is True:
+                argv.append(flag)
+            elif value not in (False, None):
+                raise OptionError(f"{flag} is an on/off switch")
+            continue
+        if value is None or value == "" or value == []:
+            continue
+        values = value if isinstance(value, list) else [value]
+        for v in values:
+            if isinstance(v, bool) or not isinstance(v, (int, float, str)) or len(str(v)) > 40 \
+                    or str(v).strip() != str(v) or str(v).startswith("-") or not str(v):
+                raise OptionError(f"{flag}: '{v}' isn't a value it takes")
+        argv += [flag, *(str(v) for v in values)]
+    return argv
+
+
 def ordered_rows(a):
     rows = PLANS[a.plan]
     if a.plan == "pollution-levels":
@@ -545,6 +610,14 @@ def ordered_rows(a):
                 + [row for row in rows if row[1].startswith("steps95")]
                 + [row for row in rows if row[1].startswith("steps85")])
     return rows
+
+
+def pollution_order(a):
+    """The pollution-levels plan runs its duty blocks in an order drawn from the session seed,
+    so slow drift over a session doesn't always land on the same duty."""
+    if a.plan != "pollution-levels":
+        return None
+    return random.Random(f"{a.seed}-pollution-order").sample(POLLUTION_DUTIES, len(POLLUTION_DUTIES))
 
 
 def build_plan(a):
@@ -562,6 +635,7 @@ def build_plan(a):
 
 
 def main():
+    mqtt_link.load_env_file()
     a = parse_args()
     data_dir = a.data_dir or str(Path.home() / "rig-data")
     used = used_seeds(data_dir)
@@ -575,10 +649,7 @@ def main():
                  f"a new seed, so leave out --seed to get one. Reusing a seed is only for finishing "
                  f"an interrupted session with --only.")
 
-    # The pollution-levels plan runs its duty blocks in an order drawn from the session seed,
-    # so slow drift over a session doesn't always land on the same duty
-    a.pollution_order = (random.Random(f"{a.seed}-pollution-order").sample(POLLUTION_DUTIES, len(POLLUTION_DUTIES))
-                         if a.plan == "pollution-levels" else None)
+    a.pollution_order = pollution_order(a)
     plan = build_plan(a)
     if not plan:
         sys.exit("Nothing to run: --only and --skip leave no runs.")
@@ -608,9 +679,10 @@ def main():
     if a.list:
         return
     if not a.broker:
-        sys.exit("Give the laptop's address with --broker.")
+        sys.exit("Give the broker with --broker, or set RIG_BROKER (for example in ~/.config/light-polluter/rig.env).")
 
     import rig  # imported here so --list works on a computer without the Pi's libraries
+    rig.hardware_lock(data_dir)
 
     try:
         sensor = rig.adafruit_tsl2591.TSL2591(rig.board.I2C())
@@ -642,8 +714,8 @@ def main():
         if not pub.connected.wait(10):
             if position == 1:
                 pub.close()
-                sys.exit(f"Couldn't reach the broker at {a.broker}:{a.port}. Is Mosquitto "
-                         f"running on the laptop, and is that the laptop's address?")
+                sys.exit(f"Couldn't reach the broker at {mqtt_link.describe(a.broker, a.port)}. Check the "
+                         f"address, that the broker is running, and the username and password if it needs them.")
             print("WARNING: can't reach the broker right now. Carrying on; this run is "
                   f"saved on the Pi in {pub.backup_path}")
 
@@ -652,7 +724,7 @@ def main():
 
         schedule_seed, pollution_seed = run_seeds(a.seed, name)
         has_pollution = row["pollution_level"] in ("low", "high")  # runs with a random pollution schedule
-        pub.send("meta", {"event": "start", "test": name, "plan": a.plan, "session": session,
+        pub.send("meta", {"event": "start", "test": name, **mqtt_link.run_labels(), "plan": a.plan, "session": session,
                           "run_index": row["number"], "position": position,
                           "run_order": a.block_order if a.plan == "small-steps" else None,
                           "pollution_order": a.pollution_order,

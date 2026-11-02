@@ -14,11 +14,15 @@ Nothing is analysed here. The Pi only records what the sensor saw and what it
 just told the LEDs to do. A copy of every message is also written to
 ~/rig-data/<run>.jsonl on the Pi, so a Wi-Fi drop can't lose any data.
 
+The broker is --broker or RIG_BROKER: the laptop's address, or the cloud broker
+(wss://...), with its username and password in the environment or in
+~/.config/light-polluter/rig.env (see mqtt_link.py).
+
 Examples:
     python rig.py --broker 192.168.1.50 --test steps
-    python rig.py --broker 192.168.1.50 --test ramp --ramp-seconds 300
-    python rig.py --broker 192.168.1.50 --test pollution
-    python rig.py --broker 192.168.1.50 --test hold --level 0.5 --hold-minutes 60
+    python rig.py --test ramp --ramp-seconds 300          # broker from rig.env
+    python rig.py --test pollution
+    python rig.py --test hold --level 0.5 --hold-minutes 60
 """
 
 import argparse
@@ -33,8 +37,9 @@ from pathlib import Path
 
 import adafruit_tsl2591
 import board
-import paho.mqtt.client as mqtt
 from gpiozero import LED, PWMLED
+
+import mqtt_link
 
 # Wiring: BCM GPIO numbers, physical header pin in brackets
 TEST_LED_PIN = 18        # [pin 12] -> FemtoBuck "Dim in". Dimmed by gpiozero, which on the Pi 5
@@ -82,12 +87,11 @@ class Publisher:
         self.closing = False
         self.connected = threading.Event()
 
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                                  client_id=f"light-rig-pi-{run_id}")
+        self.client, settings = mqtt_link.make_client(f"light-rig-pi-{run_id}", broker, port)
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.reconnect_delay_set(min_delay=1, max_delay=10)
-        self.client.connect_async(broker, port, keepalive=30)
+        self.client.connect_async(settings.host, settings.port, keepalive=30)
         self.client.loop_start()
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
@@ -115,7 +119,7 @@ class Publisher:
                 self.backup_path.parent.mkdir(parents=True, exist_ok=True)
                 self.backup = open(self.backup_path, "a", buffering=1)  # line-buffered
             self.backup.write(line + "\n")
-            self.last_info = self.client.publish(f"rig/{stream}", line, qos=1)
+            self.last_info = self.client.publish(mqtt_link.topic(stream), line, qos=1)
 
     def close(self):
         if self.last_info is not None:
@@ -128,6 +132,29 @@ class Publisher:
         self.client.loop_stop()
         if self.backup is not None:
             self.backup.close()
+
+
+_lock_file = None
+
+
+def hardware_lock(data_dir):
+    """Make sure only one rig script drives the LEDs at a time (say, a session started from the
+    web app and one started by hand). Exits with a message if another one holds the lock."""
+    global _lock_file
+    import fcntl
+    path = Path(data_dir) / ".hardware.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _lock_file = open(path, "a+")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        _lock_file.seek(0)
+        holder = _lock_file.read().strip() or "unknown"
+        sys.exit(f"Another rig script is already running on this Pi ({holder}). Stop it first.")
+    _lock_file.seek(0)
+    _lock_file.truncate()
+    _lock_file.write(f"pid {os.getpid()}: {' '.join(Path(arg).name if i == 0 else arg for i, arg in enumerate(sys.argv))}")
+    _lock_file.flush()
 
 
 class PwmSetupError(RuntimeError):
@@ -374,9 +401,11 @@ TESTS = {"steps": test_steps, "ramp": test_ramp, "pollution": test_pollution, "h
 
 
 def main():
+    mqtt_link.load_env_file()
     p = argparse.ArgumentParser(description="Light sensor rig: Pi side")
-    p.add_argument("--broker", required=True, help="the laptop's IP address, e.g. 192.168.1.50")
-    p.add_argument("--port", type=int, default=1883)
+    p.add_argument("--broker", default=os.environ.get("RIG_BROKER"),
+                   help="broker address: the laptop's IP, or the cloud broker wss://... (default: RIG_BROKER)")
+    p.add_argument("--port", type=int, default=None, help="broker port, if not the usual one for the address")
     p.add_argument("--test", choices=list(TESTS), required=True)
     p.add_argument("--level", type=float, default=1.0, help="test LED brightness 0-1 (default 1.0)")
     p.add_argument("--pollution-brightness", type=float, default=1.0,
@@ -402,6 +431,8 @@ def main():
     p.add_argument("--period", type=float, default=1.0, help="seconds between readings (default 1.0)")
     p.add_argument("--data-dir", default=str(Path.home() / "rig-data"), help="where the backup copy goes")
     a = p.parse_args()
+    if not a.broker:
+        p.error("give the broker with --broker, or set RIG_BROKER (for example in ~/.config/light-polluter/rig.env)")
     if not 0 < a.pollution_brightness <= 1:
         p.error("--pollution-brightness must be above 0 and at most 1")
     if a.pollution_pwm == "none" and a.pollution_brightness < 1:
@@ -410,6 +441,7 @@ def main():
     # Never read faster than the sensor finishes a measurement
     period = max(a.period, a.integration / 1000 + 0.02)
     run_id = time.strftime("%Y%m%d-%H%M%S") + "_" + a.test
+    hardware_lock(a.data_dir)
 
     # Hardware first, so wiring problems show up before anything else
     try:
@@ -428,8 +460,8 @@ def main():
     pub = Publisher(a.broker, a.port, run_id, a.data_dir)
     if not pub.connected.wait(10):
         pub.close()
-        sys.exit(f"Couldn't reach the broker at {a.broker}:{a.port}. Is Mosquitto running "
-                 f"on the laptop with mosquitto.conf, and is that the laptop's address?")
+        sys.exit(f"Couldn't reach the broker at {mqtt_link.describe(a.broker, a.port)}. Check the address, "
+                 f"that the broker is running, and the username and password if it needs them.")
 
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -438,7 +470,7 @@ def main():
     leds.pub = pub
     reader = SensorReader(sensor, pub, leds, period, a.gain, a.integration)
 
-    pub.send("meta", {"event": "start", "test": a.test, "settings": vars(a), "period": period,
+    pub.send("meta", {"event": "start", "test": a.test, **mqtt_link.run_labels(), "settings": vars(a), "period": period,
                       "pwm_frequency": PWM_FREQUENCY, "test_led_pin": TEST_LED_PIN,
                       "pollution_led_pin": a.pollution_pin, "pollution_pwm": leds.describe_pollution(),
                       "led_log_levels": "applied"})

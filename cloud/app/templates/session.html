@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Session {{ s.when }} – Light rig{% endblock %}
+{% block main %}
+<section class="page-head">
+  <div>
+    <p class="crumb"><a href="/sessions">Sessions</a></p>
+    <h1>{{ s.when }}</h1>
+  </div>
+  <a class="button" href="/sessions/{{ s.id }}/download">Download session (.zip)</a>
+</section>
+
+<dl class="facts">
+  <div><dt>Session</dt><dd>{{ s.id }}</dd></div>
+  <div><dt>Plan</dt><dd>{{ s.plan }}</dd></div>
+  <div><dt>Seed</dt><dd>{{ s.seed }}</dd></div>
+  {% if s.block_order %}<div><dt>Block order</dt><dd>{{ s.block_order }}</dd></div>{% endif %}
+  {% if s.pollution_order %}<div><dt>Pollution duty order</dt><dd>{{ s.pollution_order | join(", ") }}</dd></div>{% endif %}
+  <div><dt>Sensor</dt><dd>gain {{ s.settings.gain }}, {{ s.settings.integration }} ms, every {{ s.settings.period }} s</dd></div>
+  {% if s.dry_run %}<div><dt>Time scale</dt><dd>{{ s.settings.time_scale }} (dry run)</dd></div>{% endif %}
+  {% if s.partial %}<div><dt>Runs</dt><dd>Some runs only</dd></div>{% endif %}
+</dl>
+
+<div class="table-wrap">
+<table class="list runs">
+  <thead><tr><th scope="col" class="num">#</th><th scope="col">Run</th><th scope="col">Status</th>
+    <th scope="col" class="num">Readings</th><th scope="col" class="num">LED events</th><th scope="col">Files</th></tr></thead>
+  <tbody>
+  {% for r in s.runs %}
+  <tr>
+    <td class="num">{{ r.number }}</td>
+    <td><span class="kind kind-{{ 'dark' if r.name == 'dark' else 'settle' if r.name.startswith(('warmup', 'baseline')) else r.pollution_level if r.pollution_level in ('low', 'high', 'check') else 'clean' }}"></span>{{ r.name }}</td>
+    <td>{{ r.status }}</td>
+    <td class="num">{{ r.sensor }}{% if r.sensor_missing %} <span class="missing">{{ r.sensor_missing }} missing</span>{% endif %}</td>
+    <td class="num">{{ r.led }}{% if r.led_missing %} <span class="missing">{{ r.led_missing }} missing</span>{% endif %}</td>
+    <td class="files">{% for f in r.files %}<a href="/files/{{ f }}">{{ f[r.run | length + 1:] }}</a>{% endfor %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<section class="session-tools">
+  <div class="tool">
+    <h2>Checks</h2>
+    <p>Runs check_session.py on this session: every run finished, the LED log matches the plan, seeds, sensor settings, the rig against earlier sessions, step sizes and noise. It also plots each run.</p>
+    <button class="primary" id="run-check" data-session="{{ s.id }}">Run checks</button>
+    <p class="hint" id="check-status">{% if check_time %}Last run {{ check_time }}.{% endif %}</p>
+  </div>
+  <div class="tool">
+    <h2>Pi backup</h2>
+    {% if s.missing %}
+    <p>{{ s.missing }} message{{ "s" if s.missing != 1 }} from the Pi didn't arrive here. The Pi keeps a copy of everything, so fetch it to fill the gaps.</p>
+    {% else %}
+    <p>Nothing is missing. If a run is still being written or the app was down during the session, fetching the Pi's copy fills in anything that didn't arrive.</p>
+    {% endif %}
+    <button class="{{ 'primary' if s.missing else '' }}" id="fetch-backup" data-session="{{ s.id }}">Fill gaps from the Pi's backup</button>
+    <p class="hint" id="backup-status">{% if backup %}Fetched {{ backup.runs | length }} run{{ "s" if backup.runs | length != 1 }} from the Pi.{% endif %}</p>
+  </div>
+</section>
+
+<section class="check-output" id="check-output" {% if not check %}hidden{% endif %}>
+  <h2>Check results</h2>
+  <pre class="console" id="check-text" tabindex="0">{{ check or "" }}</pre>
+  <div class="plots" id="plots">
+    {% for r in s.runs %}{% set plot = r.run ~ "_plot.png" %}{% if plot in r.files %}
+    <figure><img src="/files/{{ plot }}" alt="Plot of {{ r.name }}: sensor counts and LED levels" loading="lazy"><figcaption>{{ r.number }} {{ r.name }}</figcaption></figure>
+    {% endif %}{% endfor %}
+  </div>
+</section>
+
+{% if log %}
+<details class="session-log">
+  <summary>What the Pi printed ({{ log | length }} lines)</summary>
+  <pre class="console" tabindex="0">{{ log | join("\n") }}</pre>
+</details>
+{% endif %}
+{% endblock %}
+{% block scripts %}<script src="/static/session.js?v=6"></script>{% endblock %}
